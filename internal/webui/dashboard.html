@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bezorg</title>
+  <link rel="stylesheet" href="/dashboard.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>bezorg</h1>
+      <p id="subtitle">Downloads</p>
+    </div>
+    <form id="auth" method="post" action="/">
+      <label for="token">Token</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false">
+      <button type="submit" id="unlock">Unlock</button>
+      <button type="button" id="lock" hidden>Lock</button>
+    </form>
+  </header>
+  <main>
+    <p id="banner" role="status" hidden></p>
+    <section id="stats" class="stats"></section>
+    <section class="layout">
+      <div class="panel">
+        <h2>Jobs</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Job</th>
+                <th>State</th>
+                <th>Remote</th>
+                <th>Progress</th>
+              </tr>
+            </thead>
+            <tbody id="jobs"></tbody>
+          </table>
+        </div>
+        <p id="empty" hidden>No jobs yet. Queue one with <code>bezorg fetch</code>.</p>
+      </div>
+      <aside id="detail" class="panel" hidden>
+        <h2 id="detail-title">Job</h2>
+        <dl id="detail-facts"></dl>
+        <div class="bar" aria-hidden="true"><span id="detail-bar"></span></div>
+        <p id="detail-progress"></p>
+        <div class="actions">
+          <button type="button" id="cancel">Cancel</button>
+          <button type="button" id="retry">Retry</button>
+        </div>
+        <h3>In flight</h3>
+        <ul id="inflight"></ul>
+        <h3>Failures</h3>
+        <ul id="failures"></ul>
+        <h3>Log</h3>
+        <pre id="log"></pre>
+      </aside>
+    </section>
+  </main>
+  <script src="/dashboard.js"></script>
+</body>
+</html>

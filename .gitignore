@@ -1,0 +1,17 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# Local toolchain and module cache
+.go/
+
+# Job state and sockets created during local runs
+/state/
+*.sock
+
+# Editor
+.idea/
+.vscode/
+*.swp

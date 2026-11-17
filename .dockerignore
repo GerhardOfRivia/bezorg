@@ -1,0 +1,7 @@
+.go
+.git
+state
+*.sock
+.idea
+.vscode
+*.swp

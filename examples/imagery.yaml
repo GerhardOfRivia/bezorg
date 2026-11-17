@@ -1,0 +1,46 @@
+# Large imagery drop: thousands of small files plus a few multi-gigabyte
+# Large files. Queue it with the daemon so it survives logout:
+#   bezorg fetch --config /etc/bezorg/imagery.yaml --wait
+#
+# Or run it in the foreground from cron:
+#   bezorg run --config /etc/bezorg/imagery.yaml
+protocol: ftps
+host: delivery.example.com
+port: 21
+user: imagery
+password: ${BEZORG_PASSWORD}
+
+remote: /outgoing/2026-11-17
+local: /data/imagery/2026-11-17
+
+# Six connections total. At most two of them may carry a large raster,
+# so the XML/JPEG/world-file majority keeps moving.
+concurrency: 6
+large_concurrency: 2
+large_min_bytes: 67108864
+
+connect_timeout: 30s
+stall_timeout: 2m
+keepalive: 45s
+keepalive_min_bytes: 33554432
+command_timeout: 2m
+
+retries: 8
+retry_base: 1s
+retry_max: 2m
+job_retries: 3
+job_retry_base: 30s
+job_retry_max: 10m
+
+checksum: auto
+checksum_algo: sha256
+probe_zero_size: true
+
+# Passive only. Leave trust_pasv_ip false unless the server publishes a
+# data-connection address that differs from the control host.
+disable_epsv: false
+force_ipv4: false
+trust_pasv_ip: false
+
+log_level: info
+log_format: text

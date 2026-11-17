@@ -1,0 +1,19 @@
+# Small test delivery. Point this at a lab FTP server, then:
+#   bezorg run --config examples/small.yaml
+protocol: ftp
+host: ftp.example.com
+port: 21
+user: delivery
+password: ${BEZORG_PASSWORD}
+
+remote: /incoming/sample
+local: /data/sample
+
+concurrency: 2
+large_concurrency: 1
+checksum: auto
+retries: 4
+connect_timeout: 15s
+stall_timeout: 1m
+keepalive: 30s
+log_level: info

@@ -1,0 +1,38 @@
+[Unit]
+Description=bezorg FTP/SFTP delivery downloader
+Documentation=file:///usr/local/share/doc/bezorg/README.md
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# %S is the user state home (~/.local/state, or $XDG_STATE_HOME).
+# %t is $XDG_RUNTIME_DIR. The same user's bezorg client uses this socket
+# with no BEZORG_SOCKET override.
+Environment=BEZORG_STATE_DIR=%S/bezorg
+Environment=BEZORG_SOCKET=%t/bezorg/bezorg.sock
+# Optional embedded dashboard. Leave unset to keep it disabled.
+# Environment=BEZORG_WEB_LISTEN=127.0.0.1:8080
+
+ExecStart=/usr/local/bin/bezorgd --max-jobs 2
+WorkingDirectory=%S/bezorg
+
+StateDirectory=bezorg
+StateDirectoryMode=0700
+RuntimeDirectory=bezorg
+RuntimeDirectoryMode=0700
+UMask=0077
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+KillMode=mixed
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bezorgd
+
+[Install]
+WantedBy=default.target
