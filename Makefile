@@ -3,6 +3,7 @@ BEZORG_OUTPUT ?= $(OUTPUT)/bezorg
 BEZORGD_OUTPUT ?= $(OUTPUT)/bezorgd
 SEMVER ?= 0.1.0
 VERSION ?= $(SEMVER)-dev
+RELEASE_TAG ?= v$(SEMVER)
 LDFLAGS = -ldflags "-s -w -X main.Version=$(VERSION)"
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
