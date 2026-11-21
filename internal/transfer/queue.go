@@ -124,3 +124,21 @@ func (q *workQueue) wake() {
 	q.cond.Broadcast()
 	q.mu.Unlock()
 }
+
+func (q *workQueue) depth() (small, large int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.small), len(q.large)
+}
+
+// drain drops files still waiting and reports how many were left in each lane.
+func (q *workQueue) drain() (small, large int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	small, large = len(q.small), len(q.large)
+	q.small = nil
+	q.large = nil
+	q.closed = true
+	q.cond.Broadcast()
+	return small, large
+}

@@ -27,6 +27,17 @@ func TestHelpAndUsage(t *testing.T) {
 	if !strings.Contains(stderr.String(), "--web-listen") && !strings.Contains(stdout.String(), "--web-listen") {
 		t.Fatalf("daemon help missing web listen\nstdout %s\nstderr %s", stdout.String(), stderr.String())
 	}
+	if !strings.Contains(stderr.String(), "--metrics-listen") && !strings.Contains(stdout.String(), "--metrics-listen") {
+		t.Fatalf("daemon help missing metrics listen\nstdout %s\nstderr %s", stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"run", "-h"}, &stdout, &stderr, "test"); code != exitOK {
+		t.Fatalf("run help code %d stderr %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--metrics-listen") && !strings.Contains(stdout.String(), "--metrics-listen") {
+		t.Fatalf("run help missing metrics listen\nstdout %s\nstderr %s", stdout.String(), stderr.String())
+	}
 }
 
 func TestWebPublicReadRejectsInvalid(t *testing.T) {

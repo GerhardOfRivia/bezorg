@@ -5,7 +5,7 @@
 The layout matches that split:
 
 - `bezorg` is the client. `bezorg run` downloads in the foreground. `bezorg fetch` hands the job to the daemon and returns immediately.
-- `bezorgd` is the daemon. It listens on a private Unix socket, persists job state, and resumes interrupted downloads when it starts. `--web-listen` serves a small dashboard from the same binary.
+- `bezorgd` is the daemon. It listens on a private Unix socket, persists job state, and resumes interrupted downloads when it starts. `--web-listen` serves a small dashboard and `--metrics-listen` serves Prometheus metrics from the same binary.
 
 ## Install
 
@@ -225,6 +225,69 @@ The page talks to:
 
 Send `Authorization: Bearer <token>`. Unknown API paths return JSON. The Unix-socket API under `/v1/` is unchanged and does not use this token.
 
+## Metrics
+
+`bezorgd` and `bezorg run` can expose a Prometheus text endpoint. It stays off unless a listen address is set, same as the dashboard. The address is a process setting, not a field in the job YAML: the daemon covers every job it runs, and a foreground `bezorg run` covers that one delivery.
+
+```sh
+bezorgd --metrics-listen 127.0.0.1:9090
+```
+
+`BEZORG_METRICS_LISTEN` is the same setting. `--metrics-listen` overrides it. An empty value or `off` disables the endpoint, which is the default. `disabled`, `none`, and `-` also disable it. Loopback and `localhost` are accepted. A wildcard (`0.0.0.0:9090` or `[::]:9090`) is accepted and logged as a warning, because scrapes are unauthenticated. Any other address is refused.
+
+```sh
+bezorg run --config examples/imagery.yaml --metrics-listen 127.0.0.1:9090
+```
+
+Scrape `GET /metrics`:
+
+```yaml
+scrape_configs:
+  - job_name: bezorg
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+```
+
+Inside a container, bind a wildcard and publish it on the host loopback:
+
+```sh
+docker run -d --name bezorgd --restart on-failure \
+  -p 127.0.0.1:9090:9090 \
+  -e BEZORG_STATE_DIR=/var/lib/bezorg \
+  -e BEZORG_SOCKET=/run/bezorg/bezorg.sock \
+  -v bezorg-state:/var/lib/bezorg \
+  bezorg bezorgd --metrics-listen 0.0.0.0:9090
+```
+
+Bezorg only downloads, so the series have no direction label. Labels stay small: protocol (`ftp`, `ftps`, `ftps-implicit`, `sftp`, or `auto`), plus outcome, lane, and a few fixed error classes. Paths, hosts, and job ids are not labels. An unexpected label value is reported as `other`, or `unknown` for the protocol. With `protocol: auto`, dials that fail before the banner is recognized stay `auto`; later series use `ftp` or `sftp`.
+
+Histograms use buckets from 50ms through 2h and also export `_bucket`, `_sum`, and `_count`.
+
+| Name | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `bezorg_transfers_total` | counter | `protocol`, `outcome` | Files finished by a worker. `outcome` is `downloaded`, `skipped` (the local file already matched), or `failed`. |
+| `bezorg_transfer_resumes_total` | counter | `protocol` | Downloaded files that continued from a partial file. |
+| `bezorg_transfer_bytes_total` | counter | `protocol` | Bytes read from the server. Bytes already on disk and skipped files are not included. A retry that reads the same bytes again counts them again. |
+| `bezorg_transfer_duration_seconds` | histogram | `protocol`, `outcome` | Time to finish one file, including that file's retries. |
+| `bezorg_transfers_active` | gauge | `protocol`, `lane` | Files in progress, including retry backoff. `lane` is `small` or `large`. |
+| `bezorg_connections_total` | counter | `protocol`, `result` | Dial attempts for listings and worker sessions. `result` is `success` or `error`. The optional checksum helper is not included. |
+| `bezorg_connections_active` | gauge | `protocol` | Worker sessions currently open. A listing connection is closed before this gauge moves. |
+| `bezorg_connection_penalties_total` | counter | `protocol` | Times a connection slot was held back for 30 seconds after the server reported a session limit. |
+| `bezorg_errors_total` | counter | `protocol`, `scope`, `kind` | Classified failures. `scope` is `dial`, `list`, `file`, or `job`. `kind` is `fatal`, `transient`, `limit`, or `restart`. Retried failures are included. Cancellation is not. |
+| `bezorg_retries_total` | counter | `protocol`, `scope`, `kind` | Retries scheduled after one of those failures. |
+| `bezorg_listing_duration_seconds` | histogram | `protocol`, `result` | Time to list the remote tree. `result` is `success` or `error`. `_count` is the number of listings. |
+| `bezorg_queue_files` | gauge | `lane` | Files waiting for a worker, across jobs. In-flight files are `bezorg_transfers_active`. |
+| `bezorg_jobs_queued` | gauge | | Daemon jobs waiting for a free slot. |
+| `bezorg_jobs_active` | gauge | | Daemon jobs running. |
+| `bezorg_jobs_limit` | gauge | | `--max-jobs`. Zero in a foreground `bezorg run`, which does not queue jobs. |
+| `bezorg_jobs_total` | counter | `protocol`, `outcome` | Job attempts. `outcome` is `completed`, `failed`, `canceled`, `interrupted`, or `retried`. |
+| `bezorg_job_duration_seconds` | histogram | `protocol`, `outcome` | Wall time of one job attempt. A retry includes the backoff before the job is queued again. |
+| `bezorg_build_info` | gauge | `version` | Always 1. The `version` label is the binary version. |
+
+The same registry includes the standard Go collectors (`go_goroutines`, `go_threads`, `go_info`, `go_gc_duration_seconds`, `go_memstats_*`, and the default `runtime/metrics` series) and process collectors (`process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_virtual_memory_bytes`, `process_virtual_memory_max_bytes`, `process_open_fds`, `process_max_fds`, `process_start_time_seconds`). Those names are not prefixed with `bezorg_`.
+
+Job gauges stay at zero for `bezorg run`. File, connection, listing, and queue series move in both processes.
+
 ## Container
 
 `make build` produces static binaries, so the same `bezorg` and `bezorgd` run as the container's main process. `contrib/container/Dockerfile` copies them into a small image that has a CA bundle. FTPS verification uses that store. Plain FTP and SFTP do not.
@@ -259,7 +322,7 @@ docker run -d --name bezorgd --restart on-failure \
   bezorg
 ```
 
-The dashboard is off unless the process is started with `--web-listen`. Inside the container that address has to be a wildcard, and the published port should stay on the host loopback:
+The dashboard is off unless the process is started with `--web-listen`. Prometheus metrics are off unless `--metrics-listen` is set; see [Metrics](#metrics). Inside the container that address has to be a wildcard, and the published port should stay on the host loopback:
 
 ```sh
 docker run -d --name bezorgd --restart on-failure \
