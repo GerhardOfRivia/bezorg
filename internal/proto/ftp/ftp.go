@@ -142,8 +142,18 @@ func Dial(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Session
 		_ = conn.Quit()
 		return nil, fmt.Errorf("ftp: binary mode: %w", err)
 	}
+	cfg.Protocol = protocol
+	session.cfg = cfg
 	logger.Debug("ftp session ready", "addr", addr, "protocol", protocol)
 	return session, nil
+}
+
+// Protocol reports the FTP mode used by this session.
+func (s *Session) Protocol() string {
+	if s == nil {
+		return ""
+	}
+	return s.cfg.Protocol
 }
 
 // SetTransferSize tells the session whether the next OpenAt should keep the

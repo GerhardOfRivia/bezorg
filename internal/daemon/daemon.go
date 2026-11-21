@@ -17,6 +17,7 @@ import (
 	"github.com/GerhardOfRivia/bezorg/internal/dialer"
 	"github.com/GerhardOfRivia/bezorg/internal/job"
 	"github.com/GerhardOfRivia/bezorg/internal/lock"
+	"github.com/GerhardOfRivia/bezorg/internal/metrics"
 	"github.com/GerhardOfRivia/bezorg/internal/remote"
 	"github.com/GerhardOfRivia/bezorg/internal/retry"
 	"github.com/GerhardOfRivia/bezorg/internal/transfer"
@@ -32,6 +33,7 @@ type Options struct {
 	MaxJobs       int
 	WebListen     string
 	WebPublicRead bool
+	MetricsListen string
 }
 
 // Run serves the control socket until ctx is canceled, then lets active
@@ -47,6 +49,7 @@ func Run(ctx context.Context, opt Options) error {
 	if opt.Version == "" {
 		opt.Version = "dev"
 	}
+	metrics.SetVersion(opt.Version)
 	if err := os.MkdirAll(opt.StateDir, 0o700); err != nil {
 		return err
 	}
@@ -75,6 +78,16 @@ func Run(ctx context.Context, opt Options) error {
 			return err
 		}
 	}
+	metricsServer, err := metrics.Listen(opt.MetricsListen, opt.Logger)
+	if err != nil {
+		if webServer != nil {
+			_ = webServer.Close()
+		}
+		shutCtx, cancelListen := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelListen()
+		_ = server.Shutdown(shutCtx)
+		return err
+	}
 	serveErr := make(chan error, 1)
 	go func() {
 		serveErr <- server.Serve()
@@ -87,9 +100,20 @@ func Run(ctx context.Context, opt Options) error {
 		}()
 		webErr = ch
 	}
+	var metricsErr <-chan error
+	if metricsServer != nil {
+		ch := make(chan error, 1)
+		go func() {
+			ch <- metricsServer.Serve(ctx)
+		}()
+		metricsErr = ch
+	}
 	opt.Logger.Info("daemon listening", "socket", server.Path(), "state", opt.StateDir, "max_jobs", opt.MaxJobs)
 	if webServer != nil {
 		opt.Logger.Info("web dashboard listening", "address", webServer.Address(), "token_file", webServer.TokenPath(), "public_read", opt.WebPublicRead)
+	}
+	if metricsServer != nil {
+		opt.Logger.Info("metrics listening", "address", metricsServer.Address())
 	}
 	manager.resume()
 	go manager.dispatch(ctx)
@@ -101,9 +125,16 @@ func Run(ctx context.Context, opt Options) error {
 		runErr = err
 	case err := <-webErr:
 		runErr = err
+	case err := <-metricsErr:
+		runErr = err
 	}
 	if webServer != nil {
 		if err := webServer.Close(); err != nil && runErr == nil {
+			runErr = err
+		}
+	}
+	if metricsServer != nil {
+		if err := metricsServer.Close(); err != nil && runErr == nil {
 			runErr = err
 		}
 	}
@@ -153,6 +184,7 @@ func newManager(store *job.Store, opt Options) *manager {
 		canceled:  map[string]struct{}{},
 	}
 	m.cond = sync.NewCond(&m.mu)
+	metrics.SetJobLimit(opt.MaxJobs)
 	return m
 }
 
@@ -176,8 +208,13 @@ func (m *manager) resume() {
 func (m *manager) enqueue(id string) {
 	m.mu.Lock()
 	m.queue = append(m.queue, id)
+	m.publishLocked()
 	m.cond.Broadcast()
 	m.mu.Unlock()
+}
+
+func (m *manager) publishLocked() {
+	metrics.SetJobs(m.active, len(m.queue))
 }
 
 func (m *manager) dispatch(ctx context.Context) {
@@ -198,6 +235,7 @@ func (m *manager) dispatch(ctx context.Context) {
 			defer func() {
 				m.mu.Lock()
 				m.active--
+				m.publishLocked()
 				m.cond.Broadcast()
 				m.mu.Unlock()
 			}()
@@ -217,6 +255,7 @@ func (m *manager) next(ctx context.Context) (string, bool) {
 			id := m.queue[0]
 			m.queue = m.queue[1:]
 			m.active++
+			m.publishLocked()
 			return id, true
 		}
 		m.cond.Wait()
@@ -224,7 +263,9 @@ func (m *manager) next(ctx context.Context) (string, bool) {
 }
 
 func (m *manager) execute(parent context.Context, id string) {
+	started := time.Now()
 	if m.finishIfCanceled(id) {
+		m.observeJob(id, "canceled", started)
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
@@ -243,6 +284,9 @@ func (m *manager) execute(parent context.Context, id string) {
 		m.finishIfCanceled(id)
 		if stopping && !userCanceled {
 			m.mark(id, job.StateInterrupted, 4, "daemon stopped")
+			m.observeJob(id, "interrupted", started)
+		} else {
+			m.observeJob(id, "canceled", started)
 		}
 		return
 	}
@@ -250,6 +294,7 @@ func (m *manager) execute(parent context.Context, id string) {
 	rec, err := m.store.Get(id)
 	if err != nil {
 		m.log.Error("job disappeared", "job", id, "error", err)
+		m.observeJob(id, "failed", started)
 		return
 	}
 	now := time.Now().UTC()
@@ -293,10 +338,12 @@ func (m *manager) execute(parent context.Context, id string) {
 
 	if m.wasCanceled(id) {
 		m.mark(id, job.StateCanceled, 4, "canceled")
+		m.observeJob(id, "canceled", started)
 		return
 	}
 	if m.isStopping() || errors.Is(parent.Err(), context.Canceled) || errors.Is(runErr, context.Canceled) {
 		m.mark(id, job.StateInterrupted, 4, "interrupted")
+		m.observeJob(id, "interrupted", started)
 		return
 	}
 	if runErr == nil && result.FilesFailed == 0 {
@@ -309,6 +356,7 @@ func (m *manager) execute(parent context.Context, id string) {
 			rec.FinishedAt = &finished
 		})
 		m.log.Info("job complete", "job", id, "files", result.FilesDone)
+		m.observeJob(id, "completed", started)
 		return
 	}
 	message := "download failed"
@@ -316,6 +364,8 @@ func (m *manager) execute(parent context.Context, id string) {
 		message = runErr.Error()
 	}
 	permanent := result.Permanent || retry.Classify(runErr) == retry.KindFatal
+	failure := jobFailure(permanent, runErr)
+	metrics.ObserveError(rec.Config.Protocol, "job", failure)
 	if !permanent && rec.Attempt < rec.Config.JobRetries {
 		next := rec.Attempt + 1
 		_, _ = m.store.Update(id, func(rec *job.Record) {
@@ -329,19 +379,25 @@ func (m *manager) execute(parent context.Context, id string) {
 		if err := retry.Sleep(ctx, delay); err != nil {
 			if m.wasCanceled(id) {
 				m.mark(id, job.StateCanceled, 4, "canceled")
+				m.observeJob(id, "canceled", started)
 				return
 			}
 			m.mark(id, job.StateInterrupted, 4, "interrupted")
+			m.observeJob(id, "interrupted", started)
 			return
 		}
 		if m.wasCanceled(id) || m.isStopping() {
 			if m.wasCanceled(id) {
 				m.mark(id, job.StateCanceled, 4, "canceled")
+				m.observeJob(id, "canceled", started)
 			} else {
 				m.mark(id, job.StateInterrupted, 4, "interrupted")
+				m.observeJob(id, "interrupted", started)
 			}
 			return
 		}
+		metrics.ObserveRetry(rec.Config.Protocol, "job", failure)
+		m.observeJob(id, "retried", started)
 		m.enqueue(id)
 		return
 	}
@@ -354,6 +410,25 @@ func (m *manager) execute(parent context.Context, id string) {
 		rec.FinishedAt = &finished
 	})
 	m.log.Error("job failed", "job", id, "error", message)
+	m.observeJob(id, "failed", started)
+}
+
+func (m *manager) observeJob(id, outcome string, started time.Time) {
+	protocol := "unknown"
+	if rec, err := m.store.Get(id); err == nil {
+		protocol = rec.Config.Protocol
+	}
+	metrics.ObserveJob(protocol, outcome, time.Since(started))
+}
+
+func jobFailure(permanent bool, runErr error) error {
+	if permanent {
+		return retry.ErrPermanent
+	}
+	if runErr != nil {
+		return runErr
+	}
+	return errors.New("download failed")
 }
 
 func (m *manager) jobLogger(rec job.Record) (*slog.Logger, func()) {
@@ -487,12 +562,18 @@ func (m *manager) Cancel(_ context.Context, selector string) (job.Record, error)
 		filtered = append(filtered, id)
 	}
 	m.queue = filtered
+	m.publishLocked()
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	if queued && cancel == nil {
 		m.mark(rec.ID, job.StateCanceled, 4, "canceled")
+		started := rec.CreatedAt
+		if started.IsZero() {
+			started = time.Now()
+		}
+		m.observeJob(rec.ID, "canceled", started)
 	}
 	updated, err := m.store.Get(rec.ID)
 	if err != nil {

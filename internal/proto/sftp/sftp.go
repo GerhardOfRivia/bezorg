@@ -42,6 +42,9 @@ func Dial(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Client,
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	if cfg.Protocol == "" || cfg.Protocol == config.ProtocolAuto {
+		cfg.Protocol = config.ProtocolSFTP
+	}
 	if cfg.Port == 0 {
 		cfg.Port = config.DefaultPort(config.ProtocolSFTP)
 	}
@@ -86,6 +89,14 @@ func Dial(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Client,
 	go out.keepalive()
 	logger.Debug("sftp session ready", "addr", addr)
 	return out, nil
+}
+
+// Protocol reports sftp. The dialer selects this client only for SSH.
+func (c *Client) Protocol() string {
+	if c == nil || c.cfg.Protocol == "" {
+		return config.ProtocolSFTP
+	}
+	return c.cfg.Protocol
 }
 
 // Unusable reports that the SSH connection can no longer be reused.
