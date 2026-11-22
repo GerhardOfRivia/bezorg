@@ -1,7 +1,7 @@
 OUTPUT ?= bin
 BEZORG_OUTPUT ?= $(OUTPUT)/bezorg
 BEZORGD_OUTPUT ?= $(OUTPUT)/bezorgd
-SEMVER ?= 0.1.0
+SEMVER ?= 0.2.0
 VERSION ?= $(SEMVER)-dev
 RELEASE_TAG ?= v$(SEMVER)
 LDFLAGS = -ldflags "-s -w -X main.Version=$(VERSION)"
