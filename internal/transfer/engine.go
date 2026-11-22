@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/GerhardOfRivia/bezorg/internal/config"
+	"github.com/GerhardOfRivia/bezorg/internal/metrics"
 	"github.com/GerhardOfRivia/bezorg/internal/remote"
 	"github.com/GerhardOfRivia/bezorg/internal/retry"
 	"golang.org/x/time/rate"
@@ -117,6 +118,7 @@ type engine struct {
 	mu             sync.Mutex
 	inflight       map[string]*FileProgress
 	completedBytes int64
+	observed       string
 	snap           Snapshot
 	limiter        *rate.Limiter
 	bufSize        int
@@ -200,6 +202,14 @@ func (e *engine) run(ctx context.Context) (Result, error) {
 	}
 	e.gate = newGate(e.cfg.Concurrency)
 	queue := newWorkQueue(files, e.cfg.Concurrency, e.cfg.EffectiveLarge())
+	smallPending, largePending := queue.depth()
+	metrics.QueueAdd("small", smallPending)
+	metrics.QueueAdd("large", largePending)
+	defer func() {
+		smallLeft, largeLeft := queue.drain()
+		metrics.QueueAdd("small", -smallLeft)
+		metrics.QueueAdd("large", -largeLeft)
+	}()
 	go func() {
 		<-ctx.Done()
 		queue.wake()
@@ -244,6 +254,7 @@ func (e *engine) run(ctx context.Context) (Result, error) {
 }
 
 func (e *engine) list(ctx context.Context) (remote.Listing, error) {
+	started := time.Now()
 	var last error
 	for attempt := 1; attempt <= e.cfg.Retries; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -253,7 +264,12 @@ func (e *engine) list(ctx context.Context) (remote.Listing, error) {
 		if err != nil {
 			last = err
 			e.log.Warn("list dial failed", "attempt", attempt, "error", err)
-			if retry.Classify(err) == retry.KindFatal || attempt == e.cfg.Retries {
+			if ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+				metrics.Connection(e.proto(), "error")
+				e.noteFailure("dial", err, attempt)
+			}
+			if !e.canRetry(err, attempt) {
+				e.observeListing(ctx, "error", started)
 				return remote.Listing{}, err
 			}
 			if err := retry.Sleep(ctx, retry.Backoff(attempt, e.cfg.RetryBase.Std(), e.cfg.RetryMax.Std())); err != nil {
@@ -261,14 +277,21 @@ func (e *engine) list(ctx context.Context) (remote.Listing, error) {
 			}
 			continue
 		}
+		e.rememberProtocol(sess)
+		metrics.Connection(protocolOf(sess, e.proto()), "success")
 		listing, err := sess.List(ctx, e.cfg.Remote)
 		_ = sess.Close()
 		if err == nil {
+			e.observeListing(ctx, "success", started)
 			return listing, nil
 		}
 		last = err
 		e.log.Warn("list failed", "attempt", attempt, "error", err)
-		if retry.Classify(err) == retry.KindFatal || attempt == e.cfg.Retries {
+		if ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+			e.noteFailure("list", err, attempt)
+		}
+		if !e.canRetry(err, attempt) {
+			e.observeListing(ctx, "error", started)
 			return remote.Listing{}, err
 		}
 		if err := retry.Sleep(ctx, retry.Backoff(attempt, e.cfg.RetryBase.Std(), e.cfg.RetryMax.Std())); err != nil {
@@ -278,7 +301,15 @@ func (e *engine) list(ctx context.Context) (remote.Listing, error) {
 	if last == nil {
 		last = errors.New("transfer: list failed")
 	}
+	e.observeListing(ctx, "error", started)
 	return remote.Listing{}, last
+}
+
+func (e *engine) observeListing(ctx context.Context, result string, started time.Time) {
+	if ctx.Err() != nil {
+		return
+	}
+	metrics.ObserveListing(e.proto(), result, time.Since(started))
 }
 
 func (e *engine) prepare(listing remote.Listing) ([]remoteFile, error) {
@@ -332,19 +363,17 @@ func (e *engine) worker(ctx context.Context, index int, queue *workQueue) error 
 	}
 	var sess remote.Session
 	held := false
-	defer func() {
-		if sess != nil {
-			_ = sess.Close()
-		}
-		if held {
-			e.gate.Release()
-		}
-	}()
+	defer e.dropSession(&sess, &held)
 	for {
 		file, ok := queue.Pop(ctx)
 		if !ok {
 			return ctx.Err()
 		}
+		lane := "small"
+		if file.large {
+			lane = "large"
+		}
+		metrics.QueueAdd(lane, -1)
 		err := e.transfer(ctx, &sess, &held, file)
 		queue.Done(file.large)
 		if err != nil {
@@ -358,6 +387,15 @@ func (e *engine) worker(ctx context.Context, index int, queue *workQueue) error 
 
 func (e *engine) transfer(ctx context.Context, sess *remote.Session, held *bool, file remoteFile) error {
 	final, partial := e.paths(file)
+	lane := "small"
+	if file.large {
+		lane = "large"
+	}
+	started := time.Now()
+	activeProtocol := e.proto()
+	metrics.TransfersActive(activeProtocol, lane, 1)
+	defer metrics.TransfersActive(activeProtocol, lane, -1)
+
 	var last error
 	restart := false
 	for attempt := 1; attempt <= e.cfg.Retries; attempt++ {
@@ -367,18 +405,24 @@ func (e *engine) transfer(ctx context.Context, sess *remote.Session, held *bool,
 		if err := e.ensureSession(ctx, sess, held); err != nil {
 			last = err
 			e.log.Warn("dial failed", "file", file.rel, "attempt", attempt, "error", err)
-			if retry.Classify(err) == retry.KindFatal || attempt == e.cfg.Retries {
-				return err
+			e.noteFailure("dial", err, attempt)
+			if !e.canRetry(err, attempt) {
+				return e.failTransfer(ctx, started, err)
 			}
 			if err := retry.Sleep(ctx, retry.Backoff(attempt, e.cfg.RetryBase.Std(), e.cfg.RetryMax.Std())); err != nil {
 				return err
 			}
 			continue
 		}
-		err := e.once(ctx, *sess, file, final, partial, restart)
+		outcome, resumed, err := e.once(ctx, *sess, file, final, partial, restart)
 		if err == nil {
 			if sessionUnusable(*sess) {
 				e.dropSession(sess, held)
+			}
+			proto := e.proto()
+			metrics.ObserveTransfer(proto, outcome, time.Since(started))
+			if resumed {
+				metrics.Resume(proto)
 			}
 			return nil
 		}
@@ -388,14 +432,16 @@ func (e *engine) transfer(ctx context.Context, sess *remote.Session, held *bool,
 			restart = true
 		}
 		e.log.Warn("file attempt failed", "file", file.rel, "attempt", attempt, "error", err)
-		if kind == retry.KindFatal || attempt == e.cfg.Retries {
-			return err
+		e.noteFailure("file", err, attempt)
+		if !e.canRetry(err, attempt) {
+			return e.failTransfer(ctx, started, err)
 		}
 		if kind != retry.KindRestart || sessionUnusable(*sess) {
 			e.dropSession(sess, held)
 		}
 		if kind == retry.KindLimit {
 			e.gate.Penalize(ctx, 30*time.Second)
+			metrics.Penalty(e.proto())
 		}
 		if err := retry.Sleep(ctx, retry.Backoff(attempt, e.cfg.RetryBase.Std(), e.cfg.RetryMax.Std())); err != nil {
 			return err
@@ -404,7 +450,7 @@ func (e *engine) transfer(ctx context.Context, sess *remote.Session, held *bool,
 	if last == nil {
 		last = errors.New("transfer failed")
 	}
-	return last
+	return e.failTransfer(ctx, started, last)
 }
 
 func (e *engine) ensureSession(ctx context.Context, sess *remote.Session, held *bool) error {
@@ -420,19 +466,29 @@ func (e *engine) ensureSession(ctx context.Context, sess *remote.Session, held *
 	if err != nil {
 		e.gate.Release()
 		*held = false
-		if retry.Classify(err) == retry.KindLimit {
-			e.gate.Penalize(ctx, 30*time.Second)
+		if ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+			metrics.Connection(e.proto(), "error")
+			if retry.Classify(err) == retry.KindLimit {
+				e.gate.Penalize(ctx, 30*time.Second)
+				metrics.Penalty(e.proto())
+			}
 		}
 		return err
 	}
+	e.rememberProtocol(next)
+	proto := protocolOf(next, e.proto())
+	metrics.Connection(proto, "success")
+	metrics.ConnectionsActive(proto, 1)
 	*sess = next
 	return nil
 }
 
 func (e *engine) dropSession(sess *remote.Session, held *bool) {
-	if *sess != nil {
+	if sess != nil && *sess != nil {
+		proto := protocolOf(*sess, e.proto())
 		_ = (*sess).Close()
 		*sess = nil
+		metrics.ConnectionsActive(proto, -1)
 	}
 	if held != nil && *held {
 		e.gate.Release()
@@ -440,9 +496,9 @@ func (e *engine) dropSession(sess *remote.Session, held *bool) {
 	}
 }
 
-func (e *engine) once(ctx context.Context, sess remote.Session, file remoteFile, final, partial string, restart bool) error {
+func (e *engine) once(ctx context.Context, sess remote.Session, file remoteFile, final, partial string, restart bool) (string, bool, error) {
 	if err := os.MkdirAll(filepath.Dir(final), 0o755); err != nil {
-		return err
+		return "", false, err
 	}
 	finalInfo, finalErr := os.Stat(final)
 	partialInfo, partialErr := os.Stat(partial)
@@ -450,53 +506,54 @@ func (e *engine) once(ctx context.Context, sess remote.Session, file remoteFile,
 	if restart {
 		plan = LocalPlan{Action: ActionFetch, Offset: 0}
 	}
+	resumed := plan.Action == ActionFinish || plan.Offset > 0
 	switch plan.Action {
 	case ActionSkip:
 		if err := e.maybeChecksum(ctx, sess, file, final); err != nil {
-			return err
+			return "", false, err
 		}
 		e.complete(file, file.size, true)
 		e.log.Info("skip existing file", "file", file.rel, "bytes", file.size)
-		return nil
+		return "skipped", false, nil
 	case ActionFinish:
 		if err := e.finish(ctx, sess, file, final, partial); err != nil {
-			return err
+			return "", false, err
 		}
 		e.complete(file, countedSize(file, partial), false)
-		return nil
+		return "downloaded", true, nil
 	}
 
 	if err := e.begin(file, plan.Offset); err != nil {
-		return err
+		return "", false, err
 	}
 	flags := os.O_CREATE | os.O_RDWR
 	fh, err := os.OpenFile(partial, flags, 0o644)
 	if err != nil {
 		e.endInFlight(file.rel)
-		return err
+		return "", false, err
 	}
 	defer fh.Close()
 	if plan.Offset == 0 {
 		if err := fh.Truncate(0); err != nil {
 			e.endInFlight(file.rel)
-			return err
+			return "", false, err
 		}
 	}
 	if _, err := fh.Seek(plan.Offset, io.SeekStart); err != nil {
 		e.endInFlight(file.rel)
-		return err
+		return "", false, err
 	}
 	if file.size >= 0 && plan.Offset == file.size {
 		if err := fh.Sync(); err != nil {
 			e.endInFlight(file.rel)
-			return err
+			return "", false, err
 		}
 		if err := e.finish(ctx, sess, file, final, partial); err != nil {
 			e.endInFlight(file.rel)
-			return err
+			return "", false, err
 		}
 		e.complete(file, countedSize(file, partial), false)
-		return nil
+		return "downloaded", resumed, nil
 	}
 
 	if sized, ok := sess.(interface{ SetTransferSize(int64) }); ok {
@@ -506,9 +563,9 @@ func (e *engine) once(ctx context.Context, sess remote.Session, file remoteFile,
 	if err != nil {
 		e.endInFlight(file.rel)
 		if plan.Offset > 0 && restRejected(err) {
-			return fmt.Errorf("server rejected resume: %w", retry.ErrRestart)
+			return "", false, fmt.Errorf("server rejected resume: %w", retry.ErrRestart)
 		}
-		return err
+		return "", false, err
 	}
 	written, copyErr := copyStream(ctx, fh, body, e.cfg.StallTimeout.Std(), e.limiter, e.bufSize, func(n int64) {
 		e.addHave(file.rel, n)
@@ -516,31 +573,31 @@ func (e *engine) once(ctx context.Context, sess remote.Session, file remoteFile,
 	closeErr := body.Close()
 	if copyErr != nil {
 		e.endInFlight(file.rel)
-		return copyErr
+		return "", false, copyErr
 	}
 	if closeErr != nil && !errors.Is(closeErr, io.EOF) {
 		e.log.Debug("data close", "file", file.rel, "error", closeErr)
 	}
 	if err := fh.Sync(); err != nil {
 		e.endInFlight(file.rel)
-		return err
+		return "", false, err
 	}
 	info, err := fh.Stat()
 	if err != nil {
 		e.endInFlight(file.rel)
-		return err
+		return "", false, err
 	}
 	if file.size >= 0 && info.Size() != file.size {
 		e.endInFlight(file.rel)
-		return fmt.Errorf("short read for %s: got %d bytes, want %d (wrote %d this attempt)", file.rel, info.Size(), file.size, written)
+		return "", false, fmt.Errorf("short read for %s: got %d bytes, want %d (wrote %d this attempt)", file.rel, info.Size(), file.size, written)
 	}
 	if err := e.finish(ctx, sess, file, final, partial); err != nil {
 		e.endInFlight(file.rel)
-		return err
+		return "", false, err
 	}
 	e.complete(file, countedSize(file, final), false)
-	e.log.Info("file complete", "file", file.rel, "bytes", info.Size(), "resumed", plan.Offset > 0)
-	return nil
+	e.log.Info("file complete", "file", file.rel, "bytes", info.Size(), "resumed", resumed)
+	return "downloaded", resumed, nil
 }
 
 func (e *engine) finish(ctx context.Context, sess remote.Session, file remoteFile, final, partial string) error {
@@ -667,6 +724,9 @@ func (e *engine) addHave(rel string, n int64) {
 		fp.Have += n
 	}
 	e.mu.Unlock()
+	if n > 0 {
+		metrics.AddBytes(e.proto(), n)
+	}
 }
 
 func (e *engine) endInFlight(rel string) {

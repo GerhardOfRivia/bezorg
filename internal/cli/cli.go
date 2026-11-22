@@ -22,6 +22,7 @@ import (
 	"github.com/GerhardOfRivia/bezorg/internal/dialer"
 	"github.com/GerhardOfRivia/bezorg/internal/format"
 	"github.com/GerhardOfRivia/bezorg/internal/job"
+	"github.com/GerhardOfRivia/bezorg/internal/metrics"
 	"github.com/GerhardOfRivia/bezorg/internal/paths"
 	"github.com/GerhardOfRivia/bezorg/internal/remote"
 	"github.com/GerhardOfRivia/bezorg/internal/transfer"
@@ -37,6 +38,7 @@ const (
 
 // Run executes a bezorg client command.
 func Run(args []string, stdout, stderr io.Writer, version string) int {
+	metrics.SetVersion(version)
 	if stdout == nil {
 		stdout = io.Discard
 	}
@@ -78,6 +80,7 @@ func Run(args []string, stdout, stderr io.Writer, version string) int {
 
 // RunDaemon executes bezorgd.
 func RunDaemon(args []string, stdout, stderr io.Writer, version string) int {
+	metrics.SetVersion(version)
 	if stdout == nil {
 		stdout = io.Discard
 	}
@@ -106,6 +109,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer, version string) int {
 	logFormat := fs.String("log-format", "text", "text or json")
 	maxJobs := fs.Int("max-jobs", 2, "maximum downloads running at once")
 	webListen := fs.String("web-listen", strings.TrimSpace(os.Getenv("BEZORG_WEB_LISTEN")), "loopback or wildcard address for the embedded dashboard (for example 127.0.0.1:8080); empty disables it")
+	metricsListen := fs.String("metrics-listen", metrics.FromEnv(), metrics.ListenHelp)
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -136,6 +140,7 @@ func RunDaemon(args []string, stdout, stderr io.Writer, version string) int {
 		MaxJobs:       *maxJobs,
 		WebListen:     strings.TrimSpace(*webListen),
 		WebPublicRead: publicRead,
+		MetricsListen: strings.TrimSpace(*metricsListen),
 	})
 	if err == nil || errors.Is(err, context.Canceled) {
 		return exitOK
@@ -148,7 +153,9 @@ func RunDaemon(args []string, stdout, stderr io.Writer, version string) int {
 }
 
 func runForeground(args []string, stdout, stderr io.Writer) int {
-	cfg, _, err := parseJob(args, stderr, "bezorg run", runUsage, false)
+	fs := newJobFlagSet("bezorg run", stderr, runUsage)
+	metricsListen := fs.String("metrics-listen", metrics.FromEnv(), metrics.ListenHelp)
+	cfg, err := finishJobFlags(fs, args)
 	if err != nil {
 		return usageStatus(err, stderr)
 	}
@@ -159,6 +166,12 @@ func runForeground(args []string, stdout, stderr io.Writer) int {
 	}
 	ctx, cancel := signalContext(context.Background())
 	defer cancel()
+	stopMetrics, err := startMetrics(ctx, *metricsListen, logger)
+	if err != nil {
+		fmt.Fprintln(stderr, "bezorg:", err)
+		return exitFailed
+	}
+	defer stopMetrics()
 	result, err := transfer.Run(ctx, transfer.Request{
 		Config: cfg,
 		Logger: logger,
@@ -412,10 +425,21 @@ func parseFetch(args []string, stderr io.Writer) (config.Config, string, bool, e
 	return cfg, socketFrom(fs), *wait, nil
 }
 
-func parseJob(args []string, stderr io.Writer, name, usage string, _ bool) (config.Config, string, error) {
-	fs := newJobFlagSet(name, stderr, usage)
-	cfg, err := finishJobFlags(fs, args)
-	return cfg, socketFrom(fs), err
+func startMetrics(ctx context.Context, address string, logger *slog.Logger) (func(), error) {
+	server, err := metrics.Listen(address, logger)
+	if err != nil {
+		return nil, err
+	}
+	if server == nil {
+		return func() {}, nil
+	}
+	go func() {
+		if serveErr := server.Serve(ctx); serveErr != nil {
+			logger.Error("metrics endpoint stopped", "error", serveErr)
+		}
+	}()
+	logger.Info("metrics listening", "address", server.Address())
+	return func() { _ = server.Close() }, nil
 }
 
 func newJobFlagSet(name string, stderr io.Writer, usage string) *flag.FlagSet {
@@ -738,6 +762,8 @@ const runUsage = `usage: bezorg run [flags]
 
 Download in the foreground. The process exits when the delivery finishes.
 Partial files are kept and a later run resumes them.
+--metrics-listen serves Prometheus metrics for this process. It is also read
+from BEZORG_METRICS_LISTEN and stays off when that is empty or off.
 
 `
 
@@ -756,12 +782,15 @@ const jobsUsage = `usage: bezorg jobs [--socket path]
 const daemonUsage = `bezorgd runs downloads in the background.
 
 Usage:
-  bezorgd [--socket path] [--state-dir path] [--log-level level] [--log-format text|json] [--max-jobs n] [--web-listen host:port]
+  bezorgd [--socket path] [--state-dir path] [--log-level level] [--log-format text|json] [--max-jobs n] [--web-listen host:port] [--metrics-listen host:port]
 
 Jobs are submitted with bezorg fetch. On startup, queued, running, and
 interrupted jobs resume from the partial files already on disk.
 --web-listen serves the embedded dashboard. It is also read from
 BEZORG_WEB_LISTEN and stays off when that is empty. BEZORG_WEB_PUBLIC_READ=true
 allows browsing without a token; cancel and retry still require one.
+--metrics-listen serves Prometheus metrics at /metrics. It is also read from
+BEZORG_METRICS_LISTEN and stays off when that is empty or off. The bind rules
+match --web-listen: loopback or a wildcard.
 
 `
