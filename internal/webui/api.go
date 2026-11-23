@@ -19,13 +19,17 @@ type apiServer struct {
 
 func (api apiServer) routes() map[string]http.HandlerFunc {
 	return map[string]http.HandlerFunc{
-		"GET /api/v1/system":            api.system,
-		"GET /api/v1/jobs":              api.list,
-		"GET /api/v1/events":            api.events,
-		"GET /api/v1/jobs/{id}":         api.get,
-		"GET /api/v1/jobs/{id}/logs":    api.logs,
-		"POST /api/v1/jobs/{id}/cancel": api.cancel,
-		"POST /api/v1/jobs/{id}/retry":  api.retry,
+		"GET /api/v1/system":                   api.system,
+		"GET /api/v1/jobs":                     api.list,
+		"GET /api/v1/events":                   api.events,
+		"GET /api/v1/webhooks":                 api.listWebhooks,
+		"POST /api/v1/webhooks":                api.createWebhook,
+		"DELETE /api/v1/webhooks/{id}":         api.deleteWebhook,
+		"GET /api/v1/webhooks/{id}/deliveries": api.webhookDeliveries,
+		"GET /api/v1/jobs/{id}":                api.get,
+		"GET /api/v1/jobs/{id}/logs":           api.logs,
+		"POST /api/v1/jobs/{id}/cancel":        api.cancel,
+		"POST /api/v1/jobs/{id}/retry":         api.retry,
 	}
 }
 

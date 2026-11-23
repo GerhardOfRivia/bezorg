@@ -19,6 +19,7 @@ import (
 	"github.com/GerhardOfRivia/bezorg/internal/events"
 	"github.com/GerhardOfRivia/bezorg/internal/job"
 	"github.com/GerhardOfRivia/bezorg/internal/transfer"
+	"github.com/GerhardOfRivia/bezorg/internal/webhook"
 )
 
 func TestListenAddressRestrictions(t *testing.T) {
@@ -234,6 +235,7 @@ type fakeService struct {
 	jobs     map[string]job.Record
 	logs     map[string][]string
 	feed     []events.Event
+	hooks    *webhook.Store
 	canceled string
 	retried  string
 }
@@ -312,6 +314,34 @@ func (f *fakeService) Logs(_ context.Context, selector string, after int) ([]str
 
 func (f *fakeService) System(context.Context) (control.System, error) {
 	return f.system, nil
+}
+
+func (f *fakeService) CreateWebhook(ctx context.Context, params webhook.Params) (webhook.Hook, error) {
+	if f.hooks == nil {
+		return webhook.Hook{}, errors.New("webui test: webhooks are not used")
+	}
+	return f.hooks.Create(ctx, params)
+}
+
+func (f *fakeService) ListWebhooks(ctx context.Context) ([]webhook.Hook, error) {
+	if f.hooks == nil {
+		return []webhook.Hook{}, nil
+	}
+	return f.hooks.List(ctx)
+}
+
+func (f *fakeService) DeleteWebhook(ctx context.Context, id int64) error {
+	if f.hooks == nil {
+		return webhook.ErrNotFound
+	}
+	return f.hooks.Delete(ctx, id)
+}
+
+func (f *fakeService) ListWebhookDeliveries(ctx context.Context, id int64, status string, limit int) ([]webhook.Delivery, error) {
+	if f.hooks == nil {
+		return nil, webhook.ErrNotFound
+	}
+	return f.hooks.Deliveries(ctx, id, status, limit)
 }
 
 func (f *fakeService) Events(_ context.Context, after int64, limit int) ([]events.Event, error) {

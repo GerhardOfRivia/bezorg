@@ -117,6 +117,11 @@ var (
 		Name: "bezorg_build_info",
 		Help: "Build information for this process. The value is always 1.",
 	}, []string{"version"})
+
+	webhookDeliveries = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "bezorg_webhook_deliveries_total",
+		Help: "Webhook HTTP tries by result (succeeded, retry, or dead). URLs are not labels.",
+	}, []string{"result"})
 )
 
 func init() {
@@ -141,6 +146,7 @@ func init() {
 		jobsTotal,
 		jobDuration,
 		buildInfo,
+		webhookDeliveries,
 	)
 	SetVersion("dev")
 }
@@ -261,6 +267,16 @@ func ObserveJob(protocol, outcome string, elapsed time.Duration) {
 	outcome = jobOutcome(outcome)
 	jobsTotal.WithLabelValues(protocol, outcome).Inc()
 	jobDuration.WithLabelValues(protocol, outcome).Observe(seconds(elapsed))
+}
+
+// WebhookDelivery counts one webhook HTTP try. result is succeeded, retry, or dead.
+func WebhookDelivery(result string) {
+	switch result {
+	case "succeeded", "retry", "dead":
+	default:
+		result = "other"
+	}
+	webhookDeliveries.WithLabelValues(result).Inc()
 }
 
 // Sample returns the current value of a counter or gauge, or the number of

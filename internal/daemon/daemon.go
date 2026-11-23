@@ -23,6 +23,7 @@ import (
 	"github.com/GerhardOfRivia/bezorg/internal/remote"
 	"github.com/GerhardOfRivia/bezorg/internal/retry"
 	"github.com/GerhardOfRivia/bezorg/internal/transfer"
+	"github.com/GerhardOfRivia/bezorg/internal/webhook"
 	"github.com/GerhardOfRivia/bezorg/internal/webui"
 )
 
@@ -69,7 +70,14 @@ func Run(ctx context.Context, opt Options) error {
 	if err != nil {
 		return err
 	}
-	manager := newManager(store, eventLog, opt)
+	hookStore, err := webhook.Open(filepath.Join(opt.StateDir, "webhooks"))
+	if err != nil {
+		return err
+	}
+	if err := hookStore.Reconcile(eventLog.Snapshot()); err != nil {
+		return err
+	}
+	manager := newManager(store, eventLog, hookStore, opt)
 	server, err := control.Listen(opt.Socket, manager)
 	if err != nil {
 		return err
@@ -123,6 +131,7 @@ func Run(ctx context.Context, opt Options) error {
 	}
 	manager.resume()
 	go manager.dispatch(ctx)
+	go webhook.Run(ctx, hookStore, opt.Logger)
 
 	var runErr error
 	select {
@@ -161,6 +170,7 @@ func Run(ctx context.Context, opt Options) error {
 type manager struct {
 	store     *job.Store
 	events    *events.Log
+	hooks     *webhook.Store
 	log       *slog.Logger
 	version   string
 	socket    string
@@ -178,10 +188,11 @@ type manager struct {
 	wg       sync.WaitGroup
 }
 
-func newManager(store *job.Store, eventLog *events.Log, opt Options) *manager {
+func newManager(store *job.Store, eventLog *events.Log, hookStore *webhook.Store, opt Options) *manager {
 	m := &manager{
 		store:     store,
 		events:    eventLog,
+		hooks:     hookStore,
 		log:       opt.Logger,
 		version:   opt.Version,
 		socket:    opt.Socket,
@@ -519,7 +530,7 @@ func (m *manager) emit(rec job.Record, kind, manifest string) {
 	if m.events == nil || rec.ID == "" {
 		return
 	}
-	if _, err := m.events.Append(events.Event{
+	recorded, err := m.events.Append(events.Event{
 		Type:         kind,
 		JobID:        rec.ID,
 		ExternalID:   rec.ExternalID,
@@ -533,8 +544,16 @@ func (m *manager) emit(rec job.Record, kind, manifest string) {
 		StartedAt:    rec.StartedAt,
 		FinishedAt:   rec.FinishedAt,
 		Manifest:     manifest,
-	}); err != nil {
+	})
+	if err != nil {
 		m.log.Warn("record download event", "job", rec.ID, "type", kind, "error", err)
+		return
+	}
+	if m.hooks == nil {
+		return
+	}
+	if err := m.hooks.Enqueue(recorded); err != nil {
+		m.log.Warn("queue webhook delivery", "job", rec.ID, "type", kind, "error", err)
 	}
 }
 
@@ -670,6 +689,37 @@ func (m *manager) Logs(_ context.Context, selector string, after int) ([]string,
 		return nil, after, err
 	}
 	return m.store.Logs(rec.ID, after, 1000)
+}
+
+func (m *manager) CreateWebhook(ctx context.Context, params webhook.Params) (webhook.Hook, error) {
+	if m.hooks == nil {
+		return webhook.Hook{}, errors.New("webhooks are not configured")
+	}
+	if m.events != nil {
+		params.CreatedSeq = m.events.HighWater()
+	}
+	return m.hooks.Create(ctx, params)
+}
+
+func (m *manager) ListWebhooks(ctx context.Context) ([]webhook.Hook, error) {
+	if m.hooks == nil {
+		return nil, errors.New("webhooks are not configured")
+	}
+	return m.hooks.List(ctx)
+}
+
+func (m *manager) DeleteWebhook(ctx context.Context, id int64) error {
+	if m.hooks == nil {
+		return errors.New("webhooks are not configured")
+	}
+	return m.hooks.Delete(ctx, id)
+}
+
+func (m *manager) ListWebhookDeliveries(ctx context.Context, id int64, status string, limit int) ([]webhook.Delivery, error) {
+	if m.hooks == nil {
+		return nil, errors.New("webhooks are not configured")
+	}
+	return m.hooks.Deliveries(ctx, id, status, limit)
 }
 
 func (m *manager) Events(_ context.Context, after int64, limit int) ([]events.Event, error) {

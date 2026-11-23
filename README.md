@@ -227,6 +227,23 @@ GET /api/v1/events?after=0&timeout=60&stream=sse
 
 `stream=poll` is JSON: `{events, after, next}`. Pass `next` back as `after`. `stream=sse` is `text/event-stream` with `id`, `event`, and `data`. `Last-Event-ID` overrides `after`. An empty `Accept`, or `*/*`, stays on JSON so plain curl does not have to set a header. `Accept: text/event-stream` selects SSE when `stream` is omitted. `timeout` is seconds from 0 to 60 and defaults to 25. `0` returns what is already stored. A cursor older than the retained window resumes at the next stored sequence. Reads follow the same token rules as the other GET routes. The Unix socket does not serve this stream.
 
+## Webhooks
+
+A webhook is a subscription on this daemon. Create and delete require the bearer token. List does not, when public read is on. The secret is stored mode `0600` next to the job records and is never returned or logged.
+
+```text
+POST   /api/v1/webhooks
+GET    /api/v1/webhooks
+DELETE /api/v1/webhooks/{id}
+GET    /api/v1/webhooks/{id}/deliveries?status=pending
+```
+
+The POST body is `url`, `secret` (16 to 256 bytes), optional `events` (empty matches every download event), and optional `max_attempts` (default 8, maximum 20). The response omits the secret.
+
+Each later event queues a delivery. The POST body is the event JSON. Headers are `X-bezorg-Event`, `X-bezorg-Delivery`, and `X-bezorg-Signature: t=<unix>,v1=<hex>`. The signed string is the decimal unix time, a period, and the exact body bytes. The MAC is HMAC-SHA256, lowercase hex. Redirects are not followed. A 2xx response succeeds. Anything else retries with exponential backoff from 2 seconds, capped at 5 minutes. The delivery id stays the same across tries. After `max_attempts` the delivery is `dead` and can be listed with `status=dead`. A crash while a try is leased does not consume an attempt; the lease lasts 30 seconds. Deleting a webhook deletes its delivery history.
+
+`bezorg_webhook_deliveries_total` counts tries as `succeeded`, `retry`, or `dead`.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -369,6 +386,7 @@ Histograms use buckets from 50ms through 2h and also export `_bucket`, `_sum`, a
 | `bezorg_jobs_total` | counter | `protocol`, `outcome` | Job attempts. `outcome` is `completed`, `failed`, `canceled`, `interrupted`, or `retried`. |
 | `bezorg_job_duration_seconds` | histogram | `protocol`, `outcome` | Wall time of one job attempt. A retry includes the backoff before the job is queued again. |
 | `bezorg_build_info` | gauge | `version` | Always 1. The `version` label is the binary version. |
+| `bezorg_webhook_deliveries_total` | counter | `result` | Webhook HTTP tries. `result` is `succeeded`, `retry`, or `dead`. URLs are not labels. |
 
 The same registry includes the standard Go collectors (`go_goroutines`, `go_threads`, `go_info`, `go_gc_duration_seconds`, `go_memstats_*`, and the default `runtime/metrics` series) and process collectors (`process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_virtual_memory_bytes`, `process_virtual_memory_max_bytes`, `process_open_fds`, `process_max_fds`, `process_start_time_seconds`). Those names are not prefixed with `bezorg_`.
 
