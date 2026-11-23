@@ -270,13 +270,16 @@ The request and response shapes are in the OpenAPI document at `/openapi.json`. 
 
 ## bezorg and onderzeeer
 
-Bezorg finishes each file by renaming `name.bezorg-partial` onto `name` only after the bytes are synced and checked. When `external_id` is set, `<name>.bezorg-id` is synced and renamed into place **before** that data rename, so a watcher that sees the final name can already read the id. Point `destination` at an onderzeeer watch and exclude both suffixes. The partial file and the sidecar must not start a pipeline.
+Bezorg finishes each file by renaming `name.bezorg-partial` onto `name` only after the bytes are synced and checked. After every file in the job has that final name, it writes one completion manifest and renames that into place last. Onderzeeer should watch the directory that contains the manifest and start the pipeline on the manifest, not on the data files. Ignore `*.bezorg-partial` so an in-progress download or an in-progress manifest does not start a job.
+
+A single-file `destination` of `/data/incoming/tile.tif` puts the manifest at `/data/incoming/tile.tif.bezorg-done.json`, so the watch is `/data/incoming`. A directory `local` of `/data/incoming` puts the manifest beside that directory, at `/data/incoming.bezorg-done.json`, so the watch is `/data`.
 
 ```yaml
 # bezorg
 external_id: batch-42
-local: /data/incoming
+local: /data/incoming/tile.tif
 temp_suffix: .bezorg-partial
+done_suffix: .bezorg-done.json
 ```
 
 ```yaml
@@ -287,7 +290,6 @@ watches:
     settle_for: 1s
     exclude:
       - "*.bezorg-partial"
-      - "*.bezorg-id"
     pipeline:
       - name: process
         program: /opt/workflows/process
@@ -296,21 +298,21 @@ watches:
 
 ```go
 daemon.SetFileExternalID(func(_ config.WatchConfig, file watcher.File) (string, error) {
-    body, err := os.ReadFile(file.Path + ".bezorg-id")
+    body, err := os.ReadFile(file.Path)
     if err != nil {
         return "", err
     }
-    var sidecar struct {
+    var manifest struct {
         ExternalID string `json:"external_id"`
     }
-    if err := json.Unmarshal(body, &sidecar); err != nil {
+    if err := json.Unmarshal(body, &manifest); err != nil {
         return "", err
     }
-    return sidecar.ExternalID, nil
+    return manifest.ExternalID, nil
 })
 ```
 
-A one-file delivery can store that id unchanged. Onderzeeer treats a non-empty `external_id` as unique in the queue, so a directory delivery should have the hook append the base name, or leave the id empty and correlate on the path. The same id is on the bezorg job, the sidecar, `GET /api/v1/jobs?external_id=batch-42`, every event, and the webhook body.
+One job produces one manifest, so one onderzeeer job can carry that `external_id`. The same id is on the bezorg job, the manifest, `GET /api/v1/jobs?external_id=batch-42`, every event, and the webhook body. `download.succeeded` includes `manifest`, the absolute path of the marker.
 
 Agents should follow events instead of polling. Replace the token path with the one from the daemon log.
 
@@ -340,7 +342,7 @@ curl -sS -X POST \
   http://127.0.0.1:8080/api/v1/webhooks
 ```
 
-Pass `next` from a JSON page back as `after`. A stream that falls behind the retained 10,000 events resumes at the next stored sequence. `download.succeeded` is written only after the transfer returns, which is after the atomic rename.
+Pass `next` from a JSON page back as `after`. A stream that falls behind the retained 10,000 events resumes at the next stored sequence. `download.succeeded` is written only after the completion manifest has been renamed into place, and its payload includes that path.
 
 Webhook signatures use the raw body. The signed string is the decimal unix time, a period, and those exact bytes. Reject a timestamp outside the window you accept, then compare the hex in constant time:
 

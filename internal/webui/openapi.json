@@ -197,7 +197,8 @@
           "password": {"type": "string"},
           "private_key": {"type": "string"},
           "priority": {"type": "integer", "minimum": -1000000, "maximum": 1000000},
-          "metadata": {"type": "object", "additionalProperties": true}
+          "metadata": {"type": "object", "additionalProperties": true},
+          "done_suffix": {"type": "string", "description": "Suffix appended to destination for the completion manifest. Default .bezorg-done.json."}
         }
       },
       "Event": {
@@ -217,7 +218,8 @@
           "job_created_at": {"type": "string", "format": "date-time"},
           "updated_at": {"type": "string", "format": "date-time"},
           "started_at": {"type": "string", "format": "date-time"},
-          "finished_at": {"type": "string", "format": "date-time"}
+          "finished_at": {"type": "string", "format": "date-time"},
+          "manifest": {"type": "string", "description": "Absolute path of the completion manifest. Present on download.succeeded."}
         }
       },
       "EventPage": {"type": "object", "required": ["events", "after", "next"], "properties": {"events": {"type": "array", "items": {"$ref": "#/components/schemas/Event"}}, "after": {"type": "integer"}, "next": {"type": "integer"}}},

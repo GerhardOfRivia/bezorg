@@ -46,7 +46,7 @@ func TestOpenAPICoversRoutesAndDocsArePublic(t *testing.T) {
 		t.Fatalf("spec %d %s", spec.Code, spec.Body.String())
 	}
 	page := docsGet(t, handler, "/docs/")
-	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "X-bezorg-Signature") || !strings.Contains(page.Body.String(), "external_id") || !strings.Contains(page.Body.String(), "download.succeeded") {
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "X-bezorg-Signature") || !strings.Contains(page.Body.String(), "external_id") || !strings.Contains(page.Body.String(), "download.succeeded") || !strings.Contains(page.Body.String(), ".bezorg-done.json") {
 		t.Fatalf("docs %d %s", page.Code, page.Body.String())
 	}
 	css := docsGet(t, handler, "/docs/docs.css")
