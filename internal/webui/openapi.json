@@ -1,0 +1,258 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "bezorg dashboard API",
+    "version": "dev",
+    "description": "HTTP API served by bezorgd when --web-listen is enabled. It stays off unless that address is set. Loopback is the usual bind. A wildcard is allowed and logged as a warning because the traffic is plain HTTP.\n\nSend Authorization: Bearer with the token from the file named in the daemon log (the socket path plus .web-token). Reads require the token unless BEZORG_WEB_PUBLIC_READ=true. An invalid token is always rejected. POST and DELETE always require the token.\n\nThis document and /docs/ are readable without a token. They contain no job data or secrets. The Unix-socket /v1/ API is a separate transport and is not covered here."
+  },
+  "servers": [
+    {"url": "/", "description": "This bezorgd web listener"}
+  ],
+  "tags": [
+    {"name": "Jobs", "description": "Download jobs."},
+    {"name": "Events", "description": "Durable download lifecycle events."},
+    {"name": "Webhooks", "description": "HMAC webhook subscriptions and deliveries."}
+  ],
+  "security": [{"bearerAuth": []}],
+  "paths": {
+    "/api/v1/system": {
+      "get": {
+        "operationId": "getSystem",
+        "tags": ["Jobs"],
+        "summary": "Daemon status",
+        "responses": {"200": {"description": "Daemon status.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/System"}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}}
+      }
+    },
+    "/api/v1/jobs": {
+      "get": {
+        "operationId": "listJobs",
+        "tags": ["Jobs"],
+        "summary": "List downloads",
+        "parameters": [{"$ref": "#/components/parameters/ExternalID"}],
+        "responses": {"200": {"description": "Downloads, newest first.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobList"}}}}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}}
+      },
+      "post": {
+        "operationId": "createJob",
+        "tags": ["Jobs"],
+        "summary": "Queue a download",
+        "description": "destination must be an absolute path and must not resolve inside the daemon state directory. A source URL must not contain a password. A non-empty external_id is unique: a repeat returns 409 and the existing job.",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateDownload"}}}},
+        "responses": {
+          "201": {"description": "The download was queued.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobEnvelope"}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "409": {"description": "external_id already exists.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobConflict"}}}}
+        }
+      }
+    },
+    "/api/v1/jobs/{id}": {
+      "get": {
+        "operationId": "getJob",
+        "tags": ["Jobs"],
+        "summary": "Get one download",
+        "parameters": [{"$ref": "#/components/parameters/JobID"}],
+        "responses": {"200": {"description": "The download.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobEnvelope"}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}, "409": {"description": "The id prefix matched more than one download."}}
+      }
+    },
+    "/api/v1/jobs/{id}/logs": {
+      "get": {
+        "operationId": "getJobLogs",
+        "tags": ["Jobs"],
+        "summary": "Read job log lines",
+        "parameters": [{"$ref": "#/components/parameters/JobID"}, {"name": "after", "in": "query", "schema": {"type": "integer", "minimum": 0}}],
+        "responses": {"200": {"description": "Log lines.", "content": {"application/json": {"schema": {"type": "object", "required": ["lines", "next"], "properties": {"lines": {"type": "array", "items": {"type": "string"}}, "next": {"type": "integer"}}}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}}
+      }
+    },
+    "/api/v1/jobs/{id}/cancel": {
+      "post": {
+        "operationId": "cancelJob",
+        "tags": ["Jobs"],
+        "summary": "Cancel a download",
+        "parameters": [{"$ref": "#/components/parameters/JobID"}],
+        "responses": {"200": {"description": "The download.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobEnvelope"}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}}
+      }
+    },
+    "/api/v1/jobs/{id}/retry": {
+      "post": {
+        "operationId": "retryJob",
+        "tags": ["Jobs"],
+        "summary": "Queue a finished download again",
+        "parameters": [{"$ref": "#/components/parameters/JobID"}],
+        "responses": {"200": {"description": "The download.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JobEnvelope"}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}, "409": {"description": "The download cannot be retried."}}
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "operationId": "getEvents",
+        "tags": ["Events"],
+        "summary": "Read download events",
+        "description": "stream=poll returns JSON and is the default. stream=sse, or Accept: text/event-stream when stream is omitted, returns Server-Sent Events. Last-Event-ID overrides after. timeout is seconds from 0 to 60 and defaults to 25. A cursor older than the retained 10000 events resumes at the next stored sequence. Sequence numbers are not reused.",
+        "parameters": [
+          {"name": "after", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Return events with seq greater than this value."},
+          {"name": "stream", "in": "query", "schema": {"type": "string", "enum": ["poll", "sse"]}},
+          {"name": "timeout", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 60}},
+          {"name": "Last-Event-ID", "in": "header", "schema": {"type": "integer", "minimum": 0}}
+        ],
+        "responses": {
+          "200": {"description": "A JSON page, or a text/event-stream body.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/EventPage"}}, "text/event-stream": {"schema": {"type": "string"}}}},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"}
+        }
+      }
+    },
+    "/api/v1/webhooks": {
+      "get": {
+        "operationId": "listWebhooks",
+        "tags": ["Webhooks"],
+        "summary": "List webhook subscriptions",
+        "responses": {"200": {"description": "Subscriptions. Secrets are omitted.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/WebhookList"}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}}
+      },
+      "post": {
+        "operationId": "createWebhook",
+        "tags": ["Webhooks"],
+        "summary": "Create a webhook",
+        "description": "The secret is stored and never returned. An empty events list matches every download event.",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/WebhookCreate"}}}},
+        "responses": {"201": {"description": "The subscription, without the secret.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Webhook"}}}}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "409": {"description": "The daemon already has 20 webhooks."}}
+      }
+    },
+    "/api/v1/webhooks/{id}": {
+      "delete": {
+        "operationId": "deleteWebhook",
+        "tags": ["Webhooks"],
+        "summary": "Delete a webhook and its deliveries",
+        "parameters": [{"$ref": "#/components/parameters/WebhookID"}],
+        "responses": {"200": {"description": "Deleted.", "content": {"application/json": {"schema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "integer"}}}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"description": "Webhook not found."}}
+      }
+    },
+    "/api/v1/webhooks/{id}/deliveries": {
+      "get": {
+        "operationId": "listWebhookDeliveries",
+        "tags": ["Webhooks"],
+        "summary": "List deliveries for one webhook",
+        "parameters": [{"$ref": "#/components/parameters/WebhookID"}, {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["pending", "succeeded", "dead"]}}],
+        "responses": {"200": {"description": "Deliveries, oldest first.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DeliveryList"}}}}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"description": "Webhook not found."}}
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "token"}
+    },
+    "parameters": {
+      "JobID": {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}},
+      "WebhookID": {"name": "id", "in": "path", "required": true, "schema": {"type": "integer", "minimum": 1}},
+      "ExternalID": {"name": "external_id", "in": "query", "schema": {"type": "string", "maxLength": 256}, "description": "Exact match. Empty means no filter."}
+    },
+    "responses": {
+      "BadRequest": {"description": "The request is invalid.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "Unauthorized": {"description": "A valid bearer token is required.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "NotFound": {"description": "Not found.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}
+    },
+    "schemas": {
+      "Error": {"type": "object", "required": ["error"], "properties": {"error": {"type": "string"}}},
+      "System": {"type": "object", "properties": {"version": {"type": "string"}, "socket": {"type": "string"}, "state_dir": {"type": "string"}, "active": {"type": "integer"}, "queued": {"type": "integer"}, "started_at": {"type": "string", "format": "date-time"}, "public_read": {"type": "boolean"}}},
+      "Job": {
+        "type": "object",
+        "required": ["id", "state"],
+        "properties": {
+          "id": {"type": "string"},
+          "state": {"type": "string", "enum": ["queued", "running", "completed", "failed", "canceled", "interrupted"]},
+          "external_id": {"type": "string"},
+          "priority": {"type": "integer"},
+          "metadata": {"type": "object", "additionalProperties": true},
+          "attempt": {"type": "integer"},
+          "created_at": {"type": "string", "format": "date-time"},
+          "started_at": {"type": "string", "format": "date-time"},
+          "finished_at": {"type": "string", "format": "date-time"},
+          "updated_at": {"type": "string", "format": "date-time"},
+          "error": {"type": "string"},
+          "exit_code": {"type": "integer"},
+          "config": {"type": "object", "description": "Connection settings. password and key_passphrase are redacted.", "additionalProperties": true},
+          "progress": {"type": "object", "additionalProperties": true}
+        }
+      },
+      "JobList": {"type": "object", "required": ["jobs"], "properties": {"jobs": {"type": "array", "items": {"$ref": "#/components/schemas/Job"}}}},
+      "JobEnvelope": {"type": "object", "required": ["job"], "properties": {"job": {"$ref": "#/components/schemas/Job"}}},
+      "JobConflict": {
+        "type": "object",
+        "required": ["error", "job"],
+        "properties": {
+          "error": {"type": "object", "required": ["code", "message"], "properties": {"code": {"type": "string", "const": "external_id_conflict"}, "message": {"type": "string"}}},
+          "job": {"$ref": "#/components/schemas/Job"}
+        }
+      },
+      "CreateDownload": {
+        "type": "object",
+        "properties": {
+          "external_id": {"type": "string", "maxLength": 256},
+          "source": {"type": "string", "description": "Remote path, or an ftp, ftps, or sftp URL without a password."},
+          "destination": {"type": "string", "description": "Absolute local file or directory."},
+          "remote": {"type": "string"},
+          "local": {"type": "string"},
+          "protocol": {"type": "string", "enum": ["auto", "ftp", "ftps", "ftps-implicit", "sftp"]},
+          "host": {"type": "string"},
+          "port": {"type": "integer"},
+          "user": {"type": "string"},
+          "password": {"type": "string"},
+          "private_key": {"type": "string"},
+          "priority": {"type": "integer", "minimum": -1000000, "maximum": 1000000},
+          "metadata": {"type": "object", "additionalProperties": true},
+          "done_suffix": {"type": "string", "description": "Suffix appended to destination for the completion manifest. Default .bezorg-done.json."}
+        }
+      },
+      "Event": {
+        "type": "object",
+        "required": ["seq", "type", "job_id", "remote", "local", "status", "attempts", "bytes", "created_at"],
+        "properties": {
+          "seq": {"type": "integer"},
+          "type": {"type": "string", "enum": ["download.queued", "download.started", "download.succeeded", "download.failed", "download.retried", "download.interrupted"]},
+          "job_id": {"type": "string"},
+          "external_id": {"type": "string"},
+          "remote": {"type": "string"},
+          "local": {"type": "string"},
+          "status": {"type": "string"},
+          "attempts": {"type": "integer"},
+          "bytes": {"type": "integer"},
+          "created_at": {"type": "string", "format": "date-time"},
+          "job_created_at": {"type": "string", "format": "date-time"},
+          "updated_at": {"type": "string", "format": "date-time"},
+          "started_at": {"type": "string", "format": "date-time"},
+          "finished_at": {"type": "string", "format": "date-time"},
+          "manifest": {"type": "string", "description": "Absolute path of the completion manifest. Present on download.succeeded."}
+        }
+      },
+      "EventPage": {"type": "object", "required": ["events", "after", "next"], "properties": {"events": {"type": "array", "items": {"$ref": "#/components/schemas/Event"}}, "after": {"type": "integer"}, "next": {"type": "integer"}}},
+      "WebhookCreate": {
+        "type": "object",
+        "required": ["url", "secret"],
+        "properties": {
+          "url": {"type": "string", "format": "uri"},
+          "secret": {"type": "string", "minLength": 16, "maxLength": 256},
+          "events": {"type": "array", "items": {"type": "string"}},
+          "max_attempts": {"type": "integer", "minimum": 1, "maximum": 20}
+        }
+      },
+      "Webhook": {"type": "object", "required": ["id", "url", "events", "max_attempts", "created_at"], "properties": {"id": {"type": "integer"}, "url": {"type": "string"}, "events": {"type": "array", "items": {"type": "string"}}, "max_attempts": {"type": "integer"}, "created_at": {"type": "string", "format": "date-time"}}},
+      "WebhookList": {"type": "object", "required": ["webhooks"], "properties": {"webhooks": {"type": "array", "items": {"$ref": "#/components/schemas/Webhook"}}}},
+      "Delivery": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer"},
+          "webhook_id": {"type": "integer"},
+          "event_seq": {"type": "integer"},
+          "delivery_id": {"type": "string"},
+          "event_type": {"type": "string"},
+          "payload": {"type": "string"},
+          "status": {"type": "string", "enum": ["pending", "succeeded", "dead"]},
+          "attempts": {"type": "integer"},
+          "next_attempt_at": {"type": "string", "format": "date-time"},
+          "last_error": {"type": "string"},
+          "created_at": {"type": "string", "format": "date-time"},
+          "updated_at": {"type": "string", "format": "date-time"}
+        }
+      },
+      "DeliveryList": {"type": "object", "required": ["deliveries"], "properties": {"deliveries": {"type": "array", "items": {"$ref": "#/components/schemas/Delivery"}}}}
+    }
+  }
+}

@@ -1,0 +1,15 @@
+body {
+  font: 16px/1.5 sans-serif;
+  max-width: 42rem;
+  margin: 2rem auto;
+  color: #1c1917;
+  background: #fafaf9;
+}
+
+code {
+  font-family: ui-monospace, monospace;
+}
+
+a {
+  color: #9a3412;
+}

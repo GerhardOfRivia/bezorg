@@ -266,6 +266,100 @@ A new download returns **201** `{"job": ...}`. The password is redacted. Repeati
 
 Treat that as the idempotent result and continue with the returned job. An empty `external_id` always creates a new download. `bezorg fetch --external-id` uses the same rule and prints the existing id.
 
+The request and response shapes are in the OpenAPI document at `/openapi.json`. `/docs/` is a short pointer to that document and to the handoff below. Neither URL requires the token.
+
+## bezorg and onderzeeer
+
+Bezorg finishes each file by renaming `name.bezorg-partial` onto `name` only after the bytes are synced and checked. After every file in the job has that final name, it writes one completion manifest and renames that into place last. Onderzeeer should watch the directory that contains the manifest and start the pipeline on the manifest, not on the data files. Ignore `*.bezorg-partial` so an in-progress download or an in-progress manifest does not start a job.
+
+A single-file `destination` of `/data/incoming/tile.tif` puts the manifest at `/data/incoming/tile.tif.bezorg-done.json`, so the watch is `/data/incoming`. A directory `local` of `/data/incoming` puts the manifest beside that directory, at `/data/incoming.bezorg-done.json`, so the watch is `/data`.
+
+```yaml
+# bezorg
+external_id: batch-42
+local: /data/incoming/tile.tif
+temp_suffix: .bezorg-partial
+done_suffix: .bezorg-done.json
+```
+
+```yaml
+# onderzeeer
+watches:
+  - name: incoming
+    path: /data/incoming
+    settle_for: 1s
+    exclude:
+      - "*.bezorg-partial"
+    pipeline:
+      - name: process
+        program: /opt/workflows/process
+        args: ["{{file}}"]
+```
+
+```go
+daemon.SetFileExternalID(func(_ config.WatchConfig, file watcher.File) (string, error) {
+    body, err := os.ReadFile(file.Path)
+    if err != nil {
+        return "", err
+    }
+    var manifest struct {
+        ExternalID string `json:"external_id"`
+    }
+    if err := json.Unmarshal(body, &manifest); err != nil {
+        return "", err
+    }
+    return manifest.ExternalID, nil
+})
+```
+
+One job produces one manifest, so one onderzeeer job can carry that `external_id`. The same id is on the bezorg job, the manifest, `GET /api/v1/jobs?external_id=batch-42`, every event, and the webhook body. `download.succeeded` includes `manifest`, the absolute path of the marker.
+
+Agents should follow events instead of polling. Replace the token path with the one from the daemon log.
+
+```bash
+TOKEN=$(cat /run/bezorg/bezorg.sock.web-token)
+
+# Queue one file. A second POST with this external_id returns 409 and the same job.
+curl -sS -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"external_id":"batch-42","source":"ftp://delivery@ftp.example/incoming/tile.tif","destination":"/data/incoming/tile.tif","password":"'"$BEZORG_PASSWORD"'","priority":1,"metadata":{"sensor":"landsat"}}' \
+  http://127.0.0.1:8080/api/v1/jobs
+
+# JSON long-poll. curl's default Accept selects this mode.
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8080/api/v1/events?after=0&timeout=25&stream=poll"
+
+# Server-Sent Events. Resume with the last id, or send Last-Event-ID.
+curl -N -H "Authorization: Bearer $TOKEN" -H "Accept: text/event-stream" \
+  "http://127.0.0.1:8080/api/v1/events?after=0&timeout=60"
+
+# Webhook for terminal outcomes. The secret is not returned.
+curl -sS -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://agent.example/hooks/bezorg","secret":"replace-with-a-random-secret","events":["download.succeeded","download.failed"],"max_attempts":8}' \
+  http://127.0.0.1:8080/api/v1/webhooks
+```
+
+Pass `next` from a JSON page back as `after`. A stream that falls behind the retained 10,000 events resumes at the next stored sequence. `download.succeeded` is written only after the completion manifest has been renamed into place, and its payload includes that path.
+
+Webhook signatures use the raw body. The signed string is the decimal unix time, a period, and those exact bytes. Reject a timestamp outside the window you accept, then compare the hex in constant time:
+
+```python
+import hashlib, hmac, time
+
+def verify(secret: bytes, body: bytes, header: str, tolerance: int = 300) -> bool:
+    parts = dict(item.split("=", 1) for item in header.split(","))
+    stamp = int(parts["t"])
+    if abs(int(time.time()) - stamp) > tolerance:
+        return False
+    digest = hmac.new(secret, f"{stamp}.".encode() + body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest, parts["v1"])
+```
+
+`X-bezorg-Delivery` stays the same when a delivery is retried, so receivers can ignore a duplicate. Redirects are not followed. `X-bezorg-Event` is the event type, for example `download.succeeded`.
+
 
 ## Exit codes
 

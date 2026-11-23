@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>bezorg API</title>
+  <link rel="stylesheet" href="/docs/docs.css">
+</head>
+<body>
+  <main>
+    <h1>bezorg API</h1>
+    <p>The machine-readable contract is <a href="/openapi.json">/openapi.json</a>. The listener is off unless <code>--web-listen</code> is set. Reads need the bearer token unless public read is enabled. Writes always need it.</p>
+    <h2>bezorg to onderzeeer</h2>
+    <p>Create a download with <code>external_id</code>. After every file has its final name, bezorg writes one <code>&lt;local&gt;.bezorg-done.json</code> manifest and renames it into place last. Point an onderzeeer watch at the directory that contains that manifest, ignore <code>*.bezorg-partial</code>, and read <code>external_id</code> from the manifest. Follow <code>GET /api/v1/events</code> or a webhook instead of polling jobs. <code>download.succeeded</code> includes the manifest path.</p>
+    <p>Webhook deliveries send <code>X-bezorg-Event</code>, <code>X-bezorg-Delivery</code>, and <code>X-bezorg-Signature: t=&lt;unix&gt;,v1=&lt;hmac&gt;</code>. The signed string is the unix time, a period, and the raw body.</p>
+  </main>
+</body>
+</html>
