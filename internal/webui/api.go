@@ -21,6 +21,7 @@ func (api apiServer) routes() map[string]http.HandlerFunc {
 	return map[string]http.HandlerFunc{
 		"GET /api/v1/system":                   api.system,
 		"GET /api/v1/jobs":                     api.list,
+		"POST /api/v1/jobs":                    api.createDownload,
 		"GET /api/v1/events":                   api.events,
 		"GET /api/v1/webhooks":                 api.listWebhooks,
 		"POST /api/v1/webhooks":                api.createWebhook,

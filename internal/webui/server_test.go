@@ -2,6 +2,7 @@ package webui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -240,8 +241,29 @@ type fakeService struct {
 	retried  string
 }
 
-func (f *fakeService) Submit(context.Context, config.Config) (job.Record, error) {
-	return job.Record{}, errors.New("webui test: submit is not used")
+func (f *fakeService) Submit(ctx context.Context, cfg config.Config) (job.Record, error) {
+	return f.SubmitDownload(ctx, cfg, 0, nil)
+}
+
+func (f *fakeService) SubmitDownload(_ context.Context, cfg config.Config, priority int, metadata json.RawMessage) (job.Record, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cfg.ExternalID != "" {
+		for _, rec := range f.jobs {
+			if rec.ExternalID == cfg.ExternalID {
+				return job.Public(rec), job.ErrExternalIDInUse
+			}
+		}
+	}
+	rec := job.Record{
+		ID: "created", State: job.StateQueued, ExternalID: strings.TrimSpace(cfg.ExternalID),
+		Config: cfg.Redacted(), Priority: priority, Metadata: metadata,
+	}
+	if f.jobs == nil {
+		f.jobs = map[string]job.Record{}
+	}
+	f.jobs[rec.ID] = rec
+	return job.Public(rec), nil
 }
 
 func (f *fakeService) List(_ context.Context, externalID string) ([]job.Record, error) {
