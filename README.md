@@ -139,8 +139,71 @@ YAML keys match the flags (`large-concurrency` on the command line, `large_concu
 | `bandwidth` | unlimited | Bytes per second for the whole job. |
 | `probe_zero_size` | `true` | Confirm a listed size of 0 with `SIZE`. |
 | `temp_suffix` | `.bezorg-partial` | Suffix for the file being written. |
+| `external_id` | empty | Optional correlation id, at most 256 bytes. Copied into the completion manifest. |
+| `done_suffix` | `.bezorg-done.json` | Suffix appended to `local` for the completion manifest. `--done-suffix` overrides the job. An empty job value uses `BEZORG_DONE_SUFFIX`. |
 
 `insecure: true` skips TLS verification and SSH host-key checking. Leave it off and use `known_hosts` for SFTP.
+
+## Completion manifest
+
+A successful job, including a foreground `bezorg run`, writes one manifest after every file has been renamed onto its final name. The manifest is the last thing bezorg writes for that job. Its appearance means the whole delivery is complete. A failed or interrupted job does not publish one. A crash while the manifest is still a temp file leaves no manifest behind; the partial data files stay so the next run can resume, and the manifest is written only when that run finishes.
+
+The file name is the job's `local` path plus `done_suffix`. The default suffix is `.bezorg-done.json`.
+
+| `local` | Manifest path |
+| --- | --- |
+| `/data/incoming/tile.tif` (one file) | `/data/incoming/tile.tif.bezorg-done.json` |
+| `/data/incoming` (a directory) | `/data/incoming.bezorg-done.json` |
+
+`done_suffix` can be set per job (`done_suffix:`), with `--done-suffix`, or with `BEZORG_DONE_SUFFIX` when the job leaves it empty. The flag wins. Use a suffix such as `_SUCCESS` or `.eot` to match an existing convention. It must be a filename suffix of at most 64 bytes and must differ from `temp_suffix`.
+
+The manifest is JSON, schema `schema/bezorg-done.schema.json`, Go type `transfer.Manifest`. `version` is 1. `job_id` is empty for `bezorg run`. `external_id` is present and empty when the job did not set one. `remote` is the remote path, or a URL with any userinfo removed, so it never contains credentials. `completed_at` is RFC3339 UTC. `files` lists every delivered object. `path` is relative to the directory that contains the manifest and uses forward slashes. `sha256` is the lowercase hex digest of that named file.
+
+A single-file delivery of `alpha` (5 bytes) looks like this:
+
+```json
+{
+  "version": 1,
+  "job_id": "4f2a91c0b7e3",
+  "external_id": "batch-42",
+  "remote": "/incoming/tile.tif",
+  "completed_at": "2026-11-23T08:29:00Z",
+  "files": [
+    {
+      "path": "tile.tif",
+      "size": 5,
+      "sha256": "8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8"
+    }
+  ]
+}
+```
+
+A directory job uses the same document. With `local: /data/incoming`, the manifest is `/data/incoming.bezorg-done.json` and each `path` starts with `incoming/`.
+
+`external_id` is optional on the job. Set it in YAML (`external_id:`), with `--external-id` on `bezorg run` and `bezorg fetch`, or through the HTTP API. The daemon stores it on the job record (not inside the saved connection settings) and indexes it for an exact match. The same id may label more than one job. `bezorg jobs --external-id batch-42` and `GET /api/v1/jobs?external_id=batch-42` return those jobs. `bezorg status` prints the id when one is set. An empty id is omitted from the job JSON and is `""` in the manifest.
+
+Point an onderzeeer watch at the directory that will contain the manifest. Ignore `*.bezorg-partial` so a pipeline starts only when the manifest appears, not while a file is still being written. Read `external_id` from the manifest itself:
+
+```yaml
+exclude:
+  - "*.bezorg-partial"
+```
+
+```go
+daemon.SetFileExternalID(func(_ config.WatchConfig, file watcher.File) (string, error) {
+    body, err := os.ReadFile(file.Path)
+    if err != nil {
+        return "", err
+    }
+    var manifest struct {
+        ExternalID string `json:"external_id"`
+    }
+    if err := json.Unmarshal(body, &manifest); err != nil {
+        return "", err
+    }
+    return manifest.ExternalID, nil
+})
+```
 
 ## Exit codes
 
@@ -217,7 +280,7 @@ The page talks to:
 | Method | Path | Auth |
 | --- | --- | --- |
 | GET | `/api/v1/system` | token, unless public read |
-| GET | `/api/v1/jobs` | token, unless public read |
+| GET | `/api/v1/jobs` | token, unless public read. `?external_id=` matches that id exactly |
 | GET | `/api/v1/jobs/{id}` | token, unless public read |
 | GET | `/api/v1/jobs/{id}/logs?after=N` | token, unless public read |
 | POST | `/api/v1/jobs/{id}/cancel` | token |

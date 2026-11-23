@@ -31,6 +31,13 @@ const (
 	AlgoSHA256 = "sha256"
 
 	tempSuffixDefault = ".bezorg-partial"
+
+	// DefaultDoneSuffix is the completion-manifest suffix when the job, the
+	// flag, and BEZORG_DONE_SUFFIX do not set one.
+	DefaultDoneSuffix = ".bezorg-done.json"
+
+	// MaxExternalIDBytes is the maximum stored length of an external id.
+	MaxExternalIDBytes = 256
 )
 
 // Duration is a time.Duration that accepts strings such as "30s" in YAML and JSON.
@@ -133,6 +140,15 @@ type Config struct {
 	TempSuffix string `json:"temp_suffix" yaml:"temp_suffix"`
 	LogLevel   string `json:"log_level" yaml:"log_level"`
 	LogFormat  string `json:"log_format" yaml:"log_format"`
+
+	// ExternalID is an optional caller-defined correlation id. Empty means unset.
+	// The daemon copies it onto the job record. A successful job also copies it
+	// into the completion manifest.
+	ExternalID string `json:"external_id,omitempty" yaml:"external_id,omitempty"`
+
+	// DoneSuffix is appended to the local path to name the completion manifest.
+	// Empty means BEZORG_DONE_SUFFIX, or DefaultDoneSuffix when that is unset.
+	DoneSuffix string `json:"done_suffix,omitempty" yaml:"done_suffix,omitempty"`
 }
 
 // Defaults returns production defaults for a mixed imagery drop.
@@ -191,6 +207,11 @@ func Validate(cfg Config) (Config, error) {
 	cfg.User = strings.TrimSpace(cfg.User)
 	cfg.Remote = strings.TrimSpace(cfg.Remote)
 	cfg.Local = strings.TrimSpace(cfg.Local)
+	externalID, err := NormalizeExternalID(cfg.ExternalID)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ExternalID = externalID
 
 	switch cfg.Protocol {
 	case ProtocolAuto, ProtocolFTP, ProtocolFTPS, ProtocolFTPSImplicit, ProtocolSFTP:
@@ -285,6 +306,17 @@ func Validate(cfg Config) (Config, error) {
 	if cfg.TempSuffix == "" || strings.ContainsAny(cfg.TempSuffix, `/\`) {
 		return Config{}, errors.New("config: temp_suffix must be a non-empty filename suffix")
 	}
+	if strings.TrimSpace(cfg.DoneSuffix) == "" {
+		if env := strings.TrimSpace(os.Getenv("BEZORG_DONE_SUFFIX")); env != "" {
+			cfg.DoneSuffix = env
+		} else {
+			cfg.DoneSuffix = DefaultDoneSuffix
+		}
+	}
+	cfg.DoneSuffix = strings.TrimSpace(cfg.DoneSuffix)
+	if err := validateDoneSuffix(cfg.DoneSuffix, cfg.TempSuffix); err != nil {
+		return Config{}, err
+	}
 	switch cfg.LogLevel {
 	case "debug", "info", "warn", "error":
 	default:
@@ -309,6 +341,29 @@ func Validate(cfg Config) (Config, error) {
 		cfg.Local = abs
 	}
 	return cfg, nil
+}
+
+func validateDoneSuffix(suffix, tempSuffix string) error {
+	if suffix == "" || len(suffix) > 64 || strings.ContainsAny(suffix, "/\\\x00") || strings.Contains(suffix, "..") {
+		return errors.New("config: done_suffix must be a filename suffix of at most 64 bytes")
+	}
+	if suffix == tempSuffix {
+		return errors.New("config: done_suffix must differ from temp_suffix")
+	}
+	return nil
+}
+
+// NormalizeExternalID trims an optional correlation id. An empty result is
+// unset. The id is at most MaxExternalIDBytes and cannot contain a NUL.
+func NormalizeExternalID(id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if strings.ContainsRune(id, 0) {
+		return "", errors.New("config: external_id cannot contain NUL")
+	}
+	if len(id) > MaxExternalIDBytes {
+		return "", fmt.Errorf("config: external_id is longer than %d bytes", MaxExternalIDBytes)
+	}
+	return id, nil
 }
 
 // Redacted returns a copy safe to print. Secrets are cleared.
@@ -373,6 +428,8 @@ func (cfg *Config) expandEnv() {
 	cfg.Remote = expand(cfg.Remote)
 	cfg.Local = expand(cfg.Local)
 	cfg.TempSuffix = expand(cfg.TempSuffix)
+	cfg.DoneSuffix = expand(cfg.DoneSuffix)
+	cfg.ExternalID = expand(cfg.ExternalID)
 	cfg.Checksum = expand(cfg.Checksum)
 	cfg.ChecksumAlgo = expand(cfg.ChecksumAlgo)
 	cfg.LogLevel = expand(cfg.LogLevel)

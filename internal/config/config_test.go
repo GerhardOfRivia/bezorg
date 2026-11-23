@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,6 +58,59 @@ func TestRejectsActiveModeAndBadProtocol(t *testing.T) {
 	cfg.Protocol = "scp"
 	if _, err := Validate(cfg); err == nil {
 		t.Fatal("expected bad protocol to fail")
+	}
+}
+
+func TestExternalIDIsTrimmedAndBounded(t *testing.T) {
+	cfg := Defaults()
+	cfg.Host = "ftp.example.com"
+	cfg.Remote = "/drop"
+	cfg.Local = t.TempDir()
+	cfg.Password = "secret"
+	cfg.ExternalID = "  batch-42  "
+	got, err := Validate(cfg)
+	if err != nil || got.ExternalID != "batch-42" {
+		t.Fatalf("external id = %q %v", got.ExternalID, err)
+	}
+	cfg.ExternalID = strings.Repeat("x", MaxExternalIDBytes+1)
+	if _, err := Validate(cfg); err == nil {
+		t.Fatal("oversized external id accepted")
+	}
+	cfg.ExternalID = "bad\x00id"
+	if _, err := Validate(cfg); err == nil {
+		t.Fatal("external id with NUL accepted")
+	}
+}
+
+func TestDoneSuffixFallsBackToEnvThenDefault(t *testing.T) {
+	cfg := Defaults()
+	cfg.Host = "ftp.example.com"
+	cfg.Remote = "/drop"
+	cfg.Local = t.TempDir()
+	cfg.Password = "secret"
+	t.Setenv("BEZORG_DONE_SUFFIX", "_SUCCESS")
+	got, err := Validate(cfg)
+	if err != nil || got.DoneSuffix != "_SUCCESS" {
+		t.Fatalf("suffix = %q %v", got.DoneSuffix, err)
+	}
+	cfg.DoneSuffix = ".eot"
+	got, err = Validate(cfg)
+	if err != nil || got.DoneSuffix != ".eot" {
+		t.Fatalf("job suffix = %q %v", got.DoneSuffix, err)
+	}
+	t.Setenv("BEZORG_DONE_SUFFIX", "")
+	cfg.DoneSuffix = ""
+	got, err = Validate(cfg)
+	if err != nil || got.DoneSuffix != DefaultDoneSuffix {
+		t.Fatalf("default suffix = %q %v", got.DoneSuffix, err)
+	}
+	cfg.DoneSuffix = ".bezorg-partial"
+	if _, err := Validate(cfg); err == nil {
+		t.Fatal("done suffix matching the temp suffix was accepted")
+	}
+	cfg.DoneSuffix = "nested/name"
+	if _, err := Validate(cfg); err == nil {
+		t.Fatal("done suffix with a slash was accepted")
 	}
 }
 

@@ -313,8 +313,10 @@ func (m *manager) execute(parent context.Context, id string) {
 	var lastProgress time.Time
 	var lastDone int
 	result, runErr := transfer.Run(ctx, transfer.Request{
-		Config: rec.Config,
-		Logger: logger,
+		Config:     rec.Config,
+		JobID:      rec.ID,
+		ExternalID: rec.ExternalID,
+		Logger:     logger,
 		Dial: func(ctx context.Context, cfg config.Config) (remote.Session, error) {
 			return dialer.Dial(ctx, cfg, logger)
 		},
@@ -525,8 +527,11 @@ func (m *manager) Submit(_ context.Context, cfg config.Config) (job.Record, erro
 	return job.Public(rec), nil
 }
 
-func (m *manager) List(context.Context) ([]job.Record, error) {
-	all := m.store.List()
+func (m *manager) List(_ context.Context, externalID string) ([]job.Record, error) {
+	all, err := m.store.ListByExternalID(externalID)
+	if err != nil {
+		return nil, err
+	}
 	for i := range all {
 		all[i] = job.Public(all[i])
 	}

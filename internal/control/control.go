@@ -36,7 +36,7 @@ var ErrDaemonUnavailable = errors.New("bezorgd is not running")
 // Service is the daemon surface exposed on the socket.
 type Service interface {
 	Submit(ctx context.Context, cfg config.Config) (job.Record, error)
-	List(ctx context.Context) ([]job.Record, error)
+	List(ctx context.Context, externalID string) ([]job.Record, error)
 	Get(ctx context.Context, selector string) (job.Record, error)
 	Cancel(ctx context.Context, selector string) (job.Record, error)
 	Retry(ctx context.Context, selector string) (job.Record, error)
@@ -105,7 +105,14 @@ func Listen(socketPath string, svc Service) (*Server, error) {
 		write(w, map[string]any{"job": rec}, err)
 	})
 	mux.HandleFunc("GET /v1/jobs", func(w http.ResponseWriter, r *http.Request) {
-		jobs, err := svc.List(r.Context())
+		externalID := strings.TrimSpace(r.URL.Query().Get("external_id"))
+		if externalID != "" {
+			if _, err := config.NormalizeExternalID(externalID); err != nil {
+				writeErr(w, http.StatusBadRequest, err)
+				return
+			}
+		}
+		jobs, err := svc.List(r.Context(), externalID)
 		write(w, map[string]any{"jobs": jobs}, err)
 	})
 	mux.HandleFunc("GET /v1/jobs/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -266,11 +273,15 @@ func (c *Client) Submit(ctx context.Context, cfg config.Config) (job.Record, err
 }
 
 // List returns every retained job.
-func (c *Client) List(ctx context.Context) ([]job.Record, error) {
+func (c *Client) List(ctx context.Context, externalID string) ([]job.Record, error) {
 	var response struct {
 		Jobs []job.Record `json:"jobs"`
 	}
-	err := c.do(ctx, http.MethodGet, "/v1/jobs", nil, &response)
+	path := "/v1/jobs"
+	if externalID != "" {
+		path += "?external_id=" + url.QueryEscape(externalID)
+	}
+	err := c.do(ctx, http.MethodGet, path, nil, &response)
 	return response.Jobs, err
 }
 

@@ -58,6 +58,10 @@ type FileFailure struct {
 type Result struct {
 	Snapshot
 	DryRun bool `json:"dry_run"`
+	// Manifest is the absolute path of the completion marker. It is set only
+	// after every file has its final name and the marker has been renamed
+	// into place.
+	Manifest string `json:"manifest,omitempty"`
 }
 
 // DialFunc opens one protocol session.
@@ -73,6 +77,15 @@ type Request struct {
 	Sum        SumFunc
 	Logger     *slog.Logger
 	OnProgress func(Snapshot)
+	// JobID is copied into the completion manifest. Foreground runs leave it empty.
+	JobID string
+	// ExternalID overrides Config.ExternalID when set. The daemon stores the id
+	// on the job record and passes it here.
+	ExternalID string
+	// beforeManifestRename, when set, runs after the manifest temp file is
+	// synced and before it is renamed. A non-nil error removes the temp file
+	// and fails the job. Tests use it to simulate a crash.
+	beforeManifestRename func() error
 }
 
 type hints interface {
@@ -96,13 +109,20 @@ func Run(ctx context.Context, req Request) (Result, error) {
 	if req.Dial == nil {
 		return Result{}, errors.New("transfer: dial function is required")
 	}
+	externalID := req.ExternalID
+	if externalID == "" {
+		externalID = cfg.ExternalID
+	}
 	e := &engine{
-		cfg:      cfg,
-		dial:     req.Dial,
-		sum:      req.Sum,
-		log:      logger,
-		progress: req.OnProgress,
-		inflight: map[string]*FileProgress{},
+		cfg:                  cfg,
+		dial:                 req.Dial,
+		sum:                  req.Sum,
+		log:                  logger,
+		progress:             req.OnProgress,
+		inflight:             map[string]*FileProgress{},
+		externalID:           externalID,
+		jobID:                req.JobID,
+		beforeManifestRename: req.beforeManifestRename,
 	}
 	res, err := e.run(ctx)
 	return res, err
@@ -114,6 +134,11 @@ type engine struct {
 	sum      SumFunc
 	log      *slog.Logger
 	progress func(Snapshot)
+
+	externalID           string
+	jobID                string
+	beforeManifestRename func() error
+	saved                []string
 
 	mu             sync.Mutex
 	inflight       map[string]*FileProgress
@@ -193,7 +218,7 @@ func (e *engine) run(ctx context.Context) (Result, error) {
 	if len(files) == 0 {
 		e.setPhase("done")
 		e.log.Info("remote path is empty", "remote", e.cfg.Remote)
-		return e.result(false), nil
+		return e.finishJob(e.result(false))
 	}
 
 	workers := e.cfg.Concurrency
@@ -249,7 +274,19 @@ func (e *engine) run(ctx context.Context) (Result, error) {
 		}
 		return result, runErr
 	}
+	if runErr != nil {
+		return result, runErr
+	}
 	e.log.Info("download complete", "files", result.FilesDone, "skipped", result.FilesSkipped, "bytes", result.BytesDone)
+	return e.finishJob(result)
+}
+
+func (e *engine) finishJob(result Result) (Result, error) {
+	manifest, err := e.publishManifest(time.Now())
+	if err != nil {
+		return result, err
+	}
+	result.Manifest = manifest
 	return result, nil
 }
 
@@ -736,7 +773,9 @@ func (e *engine) endInFlight(rel string) {
 }
 
 func (e *engine) complete(file remoteFile, size int64, skipped bool) {
+	final, _ := e.paths(file)
 	e.mu.Lock()
+	e.saved = append(e.saved, final)
 	delete(e.inflight, file.rel)
 	if size > 0 {
 		e.completedBytes += size

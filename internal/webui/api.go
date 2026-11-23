@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/GerhardOfRivia/bezorg/internal/config"
 	"github.com/GerhardOfRivia/bezorg/internal/control"
 	"github.com/GerhardOfRivia/bezorg/internal/job"
 )
@@ -42,7 +43,14 @@ func (api apiServer) system(output http.ResponseWriter, request *http.Request) {
 }
 
 func (api apiServer) list(output http.ResponseWriter, request *http.Request) {
-	jobs, err := api.svc.List(request.Context())
+	externalID := strings.TrimSpace(request.URL.Query().Get("external_id"))
+	if externalID != "" {
+		if _, err := config.NormalizeExternalID(externalID); err != nil {
+			writeAPIError(output, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	jobs, err := api.svc.List(request.Context(), externalID)
 	if err != nil {
 		writeServiceError(output, err)
 		return
