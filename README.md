@@ -139,8 +139,52 @@ YAML keys match the flags (`large-concurrency` on the command line, `large_concu
 | `bandwidth` | unlimited | Bytes per second for the whole job. |
 | `probe_zero_size` | `true` | Confirm a listed size of 0 with `SIZE`. |
 | `temp_suffix` | `.bezorg-partial` | Suffix for the file being written. |
+| `external_id` | empty | Optional correlation id, at most 256 bytes. See below. |
 
 `insecure: true` skips TLS verification and SSH host-key checking. Leave it off and use `known_hosts` for SFTP.
+
+## Correlating a download
+
+`external_id` is optional. Set it in the YAML (`external_id:`), with `--external-id` on `bezorg run` and `bezorg fetch`, or later through the HTTP API. The daemon stores it on the job record (not inside the saved connection settings) and indexes it for an exact match. The same id may label more than one job. `bezorg jobs --external-id batch-42` and `GET /api/v1/jobs?external_id=batch-42` return those jobs. `bezorg status` prints the id when one is set. An empty id is omitted from JSON.
+
+When the id is set, each finished file gets a sibling sidecar named `<final>.bezorg-id`. Bezorg writes that file with the temp suffix, syncs it, and renames it into place **before** renaming `name.bezorg-partial` onto `name`. A crash after the sidecar rename and before the data rename leaves the partial file to resume, and the next attempt rewrites the sidecar. No sidecar is written when the id is empty, or on a dry run.
+
+The sidecar is JSON:
+
+```json
+{
+  "external_id": "batch-42",
+  "job_id": "4f2a91c0b7e3",
+  "remote": "/incoming/tile.tif",
+  "local": "/data/incoming/tile.tif"
+}
+```
+
+Point `local` at an onderzeeer watch, exclude both the partial suffix and the sidecar, and read the id in the file-drop hook. The data file is the pipeline input. The sidecar is only the correlation record, and it is already durable when the data file appears.
+
+```yaml
+exclude:
+  - "*.bezorg-partial"
+  - "*.bezorg-id"
+```
+
+```go
+daemon.SetFileExternalID(func(_ config.WatchConfig, file watcher.File) (string, error) {
+    body, err := os.ReadFile(file.Path + ".bezorg-id")
+    if err != nil {
+        return "", err
+    }
+    var sidecar struct {
+        ExternalID string `json:"external_id"`
+    }
+    if err := json.Unmarshal(body, &sidecar); err != nil {
+        return "", err
+    }
+    return sidecar.ExternalID, nil
+})
+```
+
+A directory delivery repeats one job-level id on every file. Onderzeeer treats a non-empty `external_id` as unique per queue, so a hook for a multi-file drop should make the stored id unique (for example the bezorg id plus the base name) or leave it empty and correlate on the path. A one-file delivery can store `external_id` unchanged.
 
 ## Exit codes
 
@@ -217,7 +261,7 @@ The page talks to:
 | Method | Path | Auth |
 | --- | --- | --- |
 | GET | `/api/v1/system` | token, unless public read |
-| GET | `/api/v1/jobs` | token, unless public read |
+| GET | `/api/v1/jobs` | token, unless public read. `?external_id=` matches that id exactly |
 | GET | `/api/v1/jobs/{id}` | token, unless public read |
 | GET | `/api/v1/jobs/{id}/logs?after=N` | token, unless public read |
 | POST | `/api/v1/jobs/{id}/cancel` | token |

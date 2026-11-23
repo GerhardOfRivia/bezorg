@@ -31,6 +31,9 @@ const (
 	AlgoSHA256 = "sha256"
 
 	tempSuffixDefault = ".bezorg-partial"
+
+	// MaxExternalIDBytes is the maximum stored length of an external id.
+	MaxExternalIDBytes = 256
 )
 
 // Duration is a time.Duration that accepts strings such as "30s" in YAML and JSON.
@@ -133,6 +136,11 @@ type Config struct {
 	TempSuffix string `json:"temp_suffix" yaml:"temp_suffix"`
 	LogLevel   string `json:"log_level" yaml:"log_level"`
 	LogFormat  string `json:"log_format" yaml:"log_format"`
+
+	// ExternalID is an optional caller-defined correlation id. Empty means unset.
+	// The daemon copies it onto the job record; the transfer engine writes it
+	// into a sibling sidecar before the final rename.
+	ExternalID string `json:"external_id,omitempty" yaml:"external_id,omitempty"`
 }
 
 // Defaults returns production defaults for a mixed imagery drop.
@@ -191,6 +199,11 @@ func Validate(cfg Config) (Config, error) {
 	cfg.User = strings.TrimSpace(cfg.User)
 	cfg.Remote = strings.TrimSpace(cfg.Remote)
 	cfg.Local = strings.TrimSpace(cfg.Local)
+	externalID, err := NormalizeExternalID(cfg.ExternalID)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ExternalID = externalID
 
 	switch cfg.Protocol {
 	case ProtocolAuto, ProtocolFTP, ProtocolFTPS, ProtocolFTPSImplicit, ProtocolSFTP:
@@ -309,6 +322,19 @@ func Validate(cfg Config) (Config, error) {
 		cfg.Local = abs
 	}
 	return cfg, nil
+}
+
+// NormalizeExternalID trims an optional correlation id. An empty result is
+// unset. The id is at most MaxExternalIDBytes and cannot contain a NUL.
+func NormalizeExternalID(id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if strings.ContainsRune(id, 0) {
+		return "", errors.New("config: external_id cannot contain NUL")
+	}
+	if len(id) > MaxExternalIDBytes {
+		return "", fmt.Errorf("config: external_id is longer than %d bytes", MaxExternalIDBytes)
+	}
+	return id, nil
 }
 
 // Redacted returns a copy safe to print. Secrets are cleared.

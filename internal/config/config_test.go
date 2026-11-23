@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,6 +58,27 @@ func TestRejectsActiveModeAndBadProtocol(t *testing.T) {
 	cfg.Protocol = "scp"
 	if _, err := Validate(cfg); err == nil {
 		t.Fatal("expected bad protocol to fail")
+	}
+}
+
+func TestExternalIDIsTrimmedAndBounded(t *testing.T) {
+	cfg := Defaults()
+	cfg.Host = "ftp.example.com"
+	cfg.Remote = "/drop"
+	cfg.Local = t.TempDir()
+	cfg.Password = "secret"
+	cfg.ExternalID = "  batch-42  "
+	got, err := Validate(cfg)
+	if err != nil || got.ExternalID != "batch-42" {
+		t.Fatalf("external id = %q %v", got.ExternalID, err)
+	}
+	cfg.ExternalID = strings.Repeat("x", MaxExternalIDBytes+1)
+	if _, err := Validate(cfg); err == nil {
+		t.Fatal("oversized external id accepted")
+	}
+	cfg.ExternalID = "bad\x00id"
+	if _, err := Validate(cfg); err == nil {
+		t.Fatal("external id with NUL accepted")
 	}
 }
 

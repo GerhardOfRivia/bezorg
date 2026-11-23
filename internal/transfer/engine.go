@@ -73,6 +73,11 @@ type Request struct {
 	Sum        SumFunc
 	Logger     *slog.Logger
 	OnProgress func(Snapshot)
+	// JobID is recorded in the correlation sidecar. Foreground runs leave it empty.
+	JobID string
+	// ExternalID overrides Config.ExternalID when set. The daemon stores the id
+	// on the job record and passes it here.
+	ExternalID string
 }
 
 type hints interface {
@@ -96,13 +101,19 @@ func Run(ctx context.Context, req Request) (Result, error) {
 	if req.Dial == nil {
 		return Result{}, errors.New("transfer: dial function is required")
 	}
+	externalID := req.ExternalID
+	if externalID == "" {
+		externalID = cfg.ExternalID
+	}
 	e := &engine{
-		cfg:      cfg,
-		dial:     req.Dial,
-		sum:      req.Sum,
-		log:      logger,
-		progress: req.OnProgress,
-		inflight: map[string]*FileProgress{},
+		cfg:        cfg,
+		dial:       req.Dial,
+		sum:        req.Sum,
+		log:        logger,
+		progress:   req.OnProgress,
+		inflight:   map[string]*FileProgress{},
+		externalID: externalID,
+		jobID:      req.JobID,
 	}
 	res, err := e.run(ctx)
 	return res, err
@@ -114,6 +125,9 @@ type engine struct {
 	sum      SumFunc
 	log      *slog.Logger
 	progress func(Snapshot)
+
+	externalID string
+	jobID      string
 
 	mu             sync.Mutex
 	inflight       map[string]*FileProgress
@@ -512,6 +526,9 @@ func (e *engine) once(ctx context.Context, sess remote.Session, file remoteFile,
 		if err := e.maybeChecksum(ctx, sess, file, final); err != nil {
 			return "", false, err
 		}
+		if err := e.publishCorrelation(file, final); err != nil {
+			return "", false, err
+		}
 		e.complete(file, file.size, true)
 		e.log.Info("skip existing file", "file", file.rel, "bytes", file.size)
 		return "skipped", false, nil
@@ -604,11 +621,24 @@ func (e *engine) finish(ctx context.Context, sess remote.Session, file remoteFil
 	if err := e.maybeChecksum(ctx, sess, file, partial); err != nil {
 		return err
 	}
+	// Publish the correlation sidecar before the data file becomes visible.
+	// A watcher that excludes the temp suffix and .bezorg-id then sees the
+	// final name only after the id is already on disk.
+	if err := e.publishCorrelation(file, final); err != nil {
+		return err
+	}
 	if err := os.Rename(partial, final); err != nil {
 		return err
 	}
 	syncDir(filepath.Dir(final))
 	return nil
+}
+
+func (e *engine) publishCorrelation(file remoteFile, final string) error {
+	if e.cfg.DryRun || e.externalID == "" {
+		return nil
+	}
+	return writeIDSidecar(final, e.cfg.TempSuffix, e.externalID, e.jobID, file.remote)
 }
 
 func (e *engine) maybeChecksum(ctx context.Context, sess remote.Session, file remoteFile, localPath string) error {

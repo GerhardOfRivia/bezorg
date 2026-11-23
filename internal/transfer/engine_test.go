@@ -263,6 +263,61 @@ func TestEngineKeepsSmallFilesMoving(t *testing.T) {
 	}
 }
 
+func TestExternalIDSidecarIsPublishedBeforeTheFinalRename(t *testing.T) {
+	store := &mem{files: map[string][]byte{"a.txt": []byte("alpha")}}
+	cfg := testConfig(t)
+	cfg.ExternalID = " batch-42 "
+	final := filepath.Join(cfg.Local, "a.txt")
+	if err := os.Mkdir(final, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Run(context.Background(), Request{Config: cfg, Dial: store.dial, JobID: "job-1"})
+	if err == nil {
+		t.Fatal("rename onto an existing directory succeeded")
+	}
+	body, err := os.ReadFile(final + ".bezorg-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"external_id": "batch-42"`)) || !bytes.Contains(body, []byte(`"job_id": "job-1"`)) || !bytes.Contains(body, []byte(`"remote": "/a.txt"`)) {
+		t.Fatalf("sidecar = %s", body)
+	}
+	if _, err := os.Stat(final + cfg.TempSuffix); err != nil {
+		t.Fatalf("partial missing after failed rename: %v", err)
+	}
+	if _, err := os.Stat(final + ".bezorg-id" + cfg.TempSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sidecar temp still present: %v", err)
+	}
+
+	if err := os.RemoveAll(final); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Run(context.Background(), Request{Config: cfg, Dial: store.dial, JobID: "job-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FilesDone != 1 || result.FilesFailed != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	got, err := os.ReadFile(final)
+	if err != nil || string(got) != "alpha" {
+		t.Fatalf("file = %q %v", got, err)
+	}
+	if _, err := os.Stat(final + ".bezorg-id"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.ExternalID = ""
+	plainDir := t.TempDir()
+	cfg.Local = plainDir
+	if _, err := Run(context.Background(), Request{Config: cfg, Dial: store.dial}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(plainDir, "a.txt.bezorg-id")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sidecar written without an external id: %v", err)
+	}
+}
+
 func TestEngineDryRunWritesNothing(t *testing.T) {
 	store := &mem{files: map[string][]byte{"only.txt": []byte("x")}}
 	cfg := testConfig(t)

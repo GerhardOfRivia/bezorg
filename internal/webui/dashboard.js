@@ -202,6 +202,7 @@ function renderDetail(job) {
   fact("User", cfg.user);
   fact("Remote", cfg.remote);
   fact("Local", cfg.local);
+  if (job.external_id) fact("External ID", job.external_id);
   fact("Started", formatTime(job.started_at));
   fact("Updated", formatTime(job.updated_at));
   if (job.error) fact("Error", job.error);

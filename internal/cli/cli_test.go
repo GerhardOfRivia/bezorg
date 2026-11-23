@@ -49,6 +49,20 @@ func TestWebPublicReadRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestExternalIDFlagIsValidated(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"jobs", "--external-id", strings.Repeat("x", 257)}, &stdout, &stderr, "test")
+	if code != exitUsage || !strings.Contains(stderr.String(), "external_id") {
+		t.Fatalf("code %d stderr %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"run", "--external-id", "bad\x00id", "--host", "example.test"}, &stdout, &stderr, "test")
+	if code != exitUsage || !strings.Contains(stderr.String(), "external_id") {
+		t.Fatalf("run code %d stderr %s", code, stderr.String())
+	}
+}
+
 func TestParseRate(t *testing.T) {
 	got, err := parseRate("2M")
 	if err != nil || got != 2*1024*1024 {

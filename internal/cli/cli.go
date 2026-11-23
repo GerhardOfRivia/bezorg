@@ -226,25 +226,31 @@ func runJobs(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	fs.Usage = func() { fmt.Fprint(stderr, jobsUsage) }
 	socket := fs.String("socket", "", "control socket")
+	externalID := fs.String("external-id", "", "exact external id to match")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
 		}
 		return exitUsage
 	}
+	if _, err := config.NormalizeExternalID(*externalID); err != nil {
+		fmt.Fprintln(stderr, "bezorg:", err)
+		return exitUsage
+	}
 	client := control.NewClient(paths.Socket(*socket))
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	jobs, err := client.List(ctx)
+	jobs, err := client.List(ctx, strings.TrimSpace(*externalID))
 	if err != nil {
 		return daemonStatus(err, stderr)
 	}
 	tw := tabwriter.NewWriter(stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tSTATE\tFILES\tBYTES\tREMOTE")
+	fmt.Fprintln(tw, "ID\tSTATE\tEXTERNAL\tFILES\tBYTES\tREMOTE")
 	for _, rec := range jobs {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			rec.ID,
 			rec.State,
+			rec.ExternalID,
 			fmt.Sprintf("%d/%d", rec.Progress.FilesDone, rec.Progress.FilesTotal),
 			format.Bytes(rec.Progress.BytesDone),
 			rec.Config.Remote,
@@ -483,6 +489,7 @@ func newJobFlagSet(name string, stderr io.Writer, usage string) *flag.FlagSet {
 	fs.Bool("dry-run", false, "list the remote files and do not write")
 	fs.String("log-level", "", "debug, info, warn, or error")
 	fs.String("log-format", "", "text or json")
+	fs.String("external-id", "", "optional correlation id stored with the download and written beside each finished file")
 	fs.String("socket", "", "daemon socket, for fetch")
 	return fs
 }
@@ -589,6 +596,8 @@ func applyFlags(cfg *config.Config, fs *flag.FlagSet) error {
 			cfg.LogLevel = f.Value.String()
 		case "log-format":
 			cfg.LogFormat = f.Value.String()
+		case "external-id":
+			cfg.ExternalID = f.Value.String()
 		}
 	})
 	return err
@@ -690,6 +699,9 @@ func printJob(w io.Writer, rec job.Record) {
 		format.Bytes(rec.Progress.BytesDone),
 		format.Bytes(rec.Progress.BytesTotal),
 	)
+	if rec.ExternalID != "" {
+		fmt.Fprintf(w, "external_id %s\n", rec.ExternalID)
+	}
 	if rec.Error != "" {
 		fmt.Fprintf(w, "error %s\n", rec.Error)
 	}
@@ -775,7 +787,9 @@ the job reaches a terminal state and uses the job's exit code.
 
 `
 
-const jobsUsage = `usage: bezorg jobs [--socket path]
+const jobsUsage = `usage: bezorg jobs [--socket path] [--external-id id]
+
+--external-id keeps only jobs whose external id matches exactly.
 
 `
 

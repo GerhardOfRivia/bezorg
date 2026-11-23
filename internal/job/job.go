@@ -48,6 +48,10 @@ type Record struct {
 	Progress   transfer.Snapshot `json:"progress"`
 	Error      string            `json:"error,omitempty"`
 	ExitCode   int               `json:"exit_code"`
+	// ExternalID is an optional caller-defined correlation id. Empty means
+	// unset and is omitted. It is indexed for exact-match lookup. The same id
+	// may appear on more than one job until a caller asks for idempotent create.
+	ExternalID string `json:"external_id,omitempty"`
 }
 
 // Terminal reports whether the daemon will not touch the job again until
@@ -63,10 +67,11 @@ func Terminal(state string) bool {
 
 // Store is a directory of JSON job records. It is safe for concurrent use.
 type Store struct {
-	dir string
-	log *slog.Logger
-	mu  sync.Mutex
-	all map[string]*Record
+	dir        string
+	log        *slog.Logger
+	mu         sync.Mutex
+	all        map[string]*Record
+	byExternal map[string][]string
 }
 
 // Open loads every job under dir/jobs. A corrupt record is skipped.
@@ -82,7 +87,7 @@ func Open(dir string, logger *slog.Logger) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := &Store{dir: dir, log: logger, all: map[string]*Record{}}
+	store := &Store{dir: dir, log: logger, all: map[string]*Record{}, byExternal: map[string][]string{}}
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -103,7 +108,9 @@ func Open(dir string, logger *slog.Logger) (*Store, error) {
 		if rec.ID == "" {
 			rec.ID = entry.Name()
 		}
+		rec.ExternalID = strings.TrimSpace(rec.ExternalID)
 		store.all[rec.ID] = &rec
+		store.indexLocked(rec.ID, rec.ExternalID)
 	}
 	return store, nil
 }
@@ -125,20 +132,62 @@ func (s *Store) Create(cfg config.Config) (Record, error) {
 			return Record{}, err
 		}
 	}
+	externalID, err := config.NormalizeExternalID(cfg.ExternalID)
+	if err != nil {
+		return Record{}, err
+	}
+	cfg.ExternalID = ""
 	now := time.Now().UTC()
 	rec := &Record{
-		ID:        id,
-		State:     StateQueued,
-		CreatedAt: now,
-		UpdatedAt: now,
-		Config:    cfg,
-		ExitCode:  -1,
+		ID:         id,
+		State:      StateQueued,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Config:     cfg,
+		ExitCode:   -1,
+		ExternalID: externalID,
 	}
 	if err := s.save(rec); err != nil {
 		return Record{}, err
 	}
 	s.all[id] = rec
+	s.indexLocked(id, rec.ExternalID)
 	return *rec, nil
+}
+
+// ListByExternalID returns jobs whose external id matches exactly, newest first.
+// An empty id returns every job. The match uses the in-memory index built when
+// the store opens and when a job is created.
+func (s *Store) ListByExternalID(externalID string) ([]Record, error) {
+	externalID = strings.TrimSpace(externalID)
+	if externalID == "" {
+		return s.List(), nil
+	}
+	if _, err := config.NormalizeExternalID(externalID); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := s.byExternal[externalID]
+	out := make([]Record, 0, len(ids))
+	for _, id := range ids {
+		rec := s.all[id]
+		if rec == nil || rec.ExternalID != externalID {
+			continue
+		}
+		out = append(out, *rec)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (s *Store) indexLocked(id, externalID string) {
+	if externalID == "" {
+		return
+	}
+	s.byExternal[externalID] = append(s.byExternal[externalID], id)
 }
 
 // Update mutates one job and writes it atomically.

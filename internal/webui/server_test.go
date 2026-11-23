@@ -178,6 +178,23 @@ func TestWildcardAllowsIPHostsOnly(t *testing.T) {
 	}
 }
 
+func TestJobsFilterExternalID(t *testing.T) {
+	svc := &fakeService{jobs: map[string]job.Record{
+		"one": {ID: "one", State: job.StateQueued, ExternalID: "batch-42", Config: config.Config{Host: "ftp.example", Remote: "/a", Local: "/data/a"}},
+		"two": {ID: "two", State: job.StateQueued, ExternalID: "other", Config: config.Config{Host: "ftp.example", Remote: "/b", Local: "/data/b"}},
+	}}
+	server := startServer(t, svc, "127.0.0.1:0", false)
+	token := readToken(t, server)
+	response, body := doRequest(t, http.MethodGet, "http://"+server.Address()+"/api/v1/jobs?external_id=batch-42", "Bearer "+token, "")
+	if response.StatusCode != http.StatusOK || !strings.Contains(body, `"id": "one"`) || strings.Contains(body, `"id": "two"`) {
+		t.Fatalf("status %d body %s", response.StatusCode, body)
+	}
+	response, body = doRequest(t, http.MethodGet, "http://"+server.Address()+"/api/v1/jobs?external_id="+strings.Repeat("x", 257), "Bearer "+token, "")
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("oversized filter status %d body %s", response.StatusCode, body)
+	}
+}
+
 func TestCloseRemovesToken(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
@@ -223,11 +240,14 @@ func (f *fakeService) Submit(context.Context, config.Config) (job.Record, error)
 	return job.Record{}, errors.New("webui test: submit is not used")
 }
 
-func (f *fakeService) List(context.Context) ([]job.Record, error) {
+func (f *fakeService) List(_ context.Context, externalID string) ([]job.Record, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]job.Record, 0, len(f.jobs))
 	for _, rec := range f.jobs {
+		if externalID != "" && rec.ExternalID != externalID {
+			continue
+		}
 		out = append(out, rec)
 	}
 	return out, nil
