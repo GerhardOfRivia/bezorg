@@ -58,6 +58,10 @@ type FileFailure struct {
 type Result struct {
 	Snapshot
 	DryRun bool `json:"dry_run"`
+	// Manifest is the absolute path of the completion marker. It is set only
+	// after every file has its final name and the marker has been renamed
+	// into place.
+	Manifest string `json:"manifest,omitempty"`
 }
 
 // DialFunc opens one protocol session.
@@ -73,11 +77,15 @@ type Request struct {
 	Sum        SumFunc
 	Logger     *slog.Logger
 	OnProgress func(Snapshot)
-	// JobID is recorded in the correlation sidecar. Foreground runs leave it empty.
+	// JobID is copied into the completion manifest. Foreground runs leave it empty.
 	JobID string
 	// ExternalID overrides Config.ExternalID when set. The daemon stores the id
 	// on the job record and passes it here.
 	ExternalID string
+	// beforeManifestRename, when set, runs after the manifest temp file is
+	// synced and before it is renamed. A non-nil error removes the temp file
+	// and fails the job. Tests use it to simulate a crash.
+	beforeManifestRename func() error
 }
 
 type hints interface {
@@ -106,14 +114,15 @@ func Run(ctx context.Context, req Request) (Result, error) {
 		externalID = cfg.ExternalID
 	}
 	e := &engine{
-		cfg:        cfg,
-		dial:       req.Dial,
-		sum:        req.Sum,
-		log:        logger,
-		progress:   req.OnProgress,
-		inflight:   map[string]*FileProgress{},
-		externalID: externalID,
-		jobID:      req.JobID,
+		cfg:                  cfg,
+		dial:                 req.Dial,
+		sum:                  req.Sum,
+		log:                  logger,
+		progress:             req.OnProgress,
+		inflight:             map[string]*FileProgress{},
+		externalID:           externalID,
+		jobID:                req.JobID,
+		beforeManifestRename: req.beforeManifestRename,
 	}
 	res, err := e.run(ctx)
 	return res, err
@@ -126,8 +135,10 @@ type engine struct {
 	log      *slog.Logger
 	progress func(Snapshot)
 
-	externalID string
-	jobID      string
+	externalID           string
+	jobID                string
+	beforeManifestRename func() error
+	saved                []string
 
 	mu             sync.Mutex
 	inflight       map[string]*FileProgress
@@ -207,7 +218,7 @@ func (e *engine) run(ctx context.Context) (Result, error) {
 	if len(files) == 0 {
 		e.setPhase("done")
 		e.log.Info("remote path is empty", "remote", e.cfg.Remote)
-		return e.result(false), nil
+		return e.finishJob(e.result(false))
 	}
 
 	workers := e.cfg.Concurrency
@@ -263,7 +274,19 @@ func (e *engine) run(ctx context.Context) (Result, error) {
 		}
 		return result, runErr
 	}
+	if runErr != nil {
+		return result, runErr
+	}
 	e.log.Info("download complete", "files", result.FilesDone, "skipped", result.FilesSkipped, "bytes", result.BytesDone)
+	return e.finishJob(result)
+}
+
+func (e *engine) finishJob(result Result) (Result, error) {
+	manifest, err := e.publishManifest(time.Now())
+	if err != nil {
+		return result, err
+	}
+	result.Manifest = manifest
 	return result, nil
 }
 
@@ -526,9 +549,6 @@ func (e *engine) once(ctx context.Context, sess remote.Session, file remoteFile,
 		if err := e.maybeChecksum(ctx, sess, file, final); err != nil {
 			return "", false, err
 		}
-		if err := e.publishCorrelation(file, final); err != nil {
-			return "", false, err
-		}
 		e.complete(file, file.size, true)
 		e.log.Info("skip existing file", "file", file.rel, "bytes", file.size)
 		return "skipped", false, nil
@@ -621,24 +641,11 @@ func (e *engine) finish(ctx context.Context, sess remote.Session, file remoteFil
 	if err := e.maybeChecksum(ctx, sess, file, partial); err != nil {
 		return err
 	}
-	// Publish the correlation sidecar before the data file becomes visible.
-	// A watcher that excludes the temp suffix and .bezorg-id then sees the
-	// final name only after the id is already on disk.
-	if err := e.publishCorrelation(file, final); err != nil {
-		return err
-	}
 	if err := os.Rename(partial, final); err != nil {
 		return err
 	}
 	syncDir(filepath.Dir(final))
 	return nil
-}
-
-func (e *engine) publishCorrelation(file remoteFile, final string) error {
-	if e.cfg.DryRun || e.externalID == "" {
-		return nil
-	}
-	return writeIDSidecar(final, e.cfg.TempSuffix, e.externalID, e.jobID, file.remote)
 }
 
 func (e *engine) maybeChecksum(ctx context.Context, sess remote.Session, file remoteFile, localPath string) error {
@@ -766,7 +773,9 @@ func (e *engine) endInFlight(rel string) {
 }
 
 func (e *engine) complete(file remoteFile, size int64, skipped bool) {
+	final, _ := e.paths(file)
 	e.mu.Lock()
+	e.saved = append(e.saved, final)
 	delete(e.inflight, file.rel)
 	if size > 0 {
 		e.completedBytes += size

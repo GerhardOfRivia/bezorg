@@ -489,7 +489,8 @@ func newJobFlagSet(name string, stderr io.Writer, usage string) *flag.FlagSet {
 	fs.Bool("dry-run", false, "list the remote files and do not write")
 	fs.String("log-level", "", "debug, info, warn, or error")
 	fs.String("log-format", "", "text or json")
-	fs.String("external-id", "", "optional correlation id stored with the download and written beside each finished file")
+	fs.String("external-id", "", "optional correlation id stored on the job and copied into the completion manifest")
+	fs.String("done-suffix", "", "completion manifest suffix appended to the local path (default .bezorg-done.json, or BEZORG_DONE_SUFFIX)")
 	fs.String("socket", "", "daemon socket, for fetch")
 	return fs
 }
@@ -598,6 +599,8 @@ func applyFlags(cfg *config.Config, fs *flag.FlagSet) error {
 			cfg.LogFormat = f.Value.String()
 		case "external-id":
 			cfg.ExternalID = f.Value.String()
+		case "done-suffix":
+			cfg.DoneSuffix = f.Value.String()
 		}
 	})
 	return err
@@ -683,6 +686,9 @@ func printResult(w io.Writer, result transfer.Result) {
 	}
 	fmt.Fprintf(w, "files %d/%d skipped %d failed %d bytes %s\n",
 		result.FilesDone, result.FilesTotal, result.FilesSkipped, result.FilesFailed, format.Bytes(result.BytesDone))
+	if result.Manifest != "" {
+		fmt.Fprintf(w, "manifest %s\n", result.Manifest)
+	}
 }
 
 func printJob(w io.Writer, rec job.Record) {

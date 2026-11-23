@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -19,13 +21,14 @@ import (
 )
 
 type mem struct {
-	mu       sync.Mutex
-	files    map[string][]byte
-	opens    []int64
-	failDial int
-	release  chan struct{}
-	started  chan struct{}
-	block    string
+	mu         sync.Mutex
+	files      map[string][]byte
+	opens      []int64
+	failDial   int
+	release    chan struct{}
+	started    chan struct{}
+	block      string
+	rootIsFile bool
 }
 
 func (m *mem) dial(context.Context, config.Config) (remote.Session, error) {
@@ -47,7 +50,7 @@ func (s *memSession) List(context.Context, string) (remote.Listing, error) {
 	for path, data := range s.mem.files {
 		files = append(files, remote.File{Rel: path, Remote: "/" + path, Size: int64(len(data))})
 	}
-	return remote.Listing{Files: files}, nil
+	return remote.Listing{Files: files, RootIsFile: s.mem.rootIsFile}, nil
 }
 
 func (s *memSession) OpenAt(_ context.Context, remotePath string, offset int64) (io.ReadCloser, error) {
@@ -263,59 +266,114 @@ func TestEngineKeepsSmallFilesMoving(t *testing.T) {
 	}
 }
 
-func TestExternalIDSidecarIsPublishedBeforeTheFinalRename(t *testing.T) {
+func TestManifestForASingleFileAndADirectory(t *testing.T) {
+	alpha := []byte("alpha")
+	bravo := []byte("bravo")
+	alphaSum := sha256.Sum256(alpha)
+	bravoSum := sha256.Sum256(bravo)
+
+	singleRoot := t.TempDir()
+	singleLocal := filepath.Join(singleRoot, "tile.tif")
+	single := &mem{files: map[string][]byte{"tile.tif": alpha}, rootIsFile: true}
+	cfg := testConfig(t)
+	cfg.Local = singleLocal
+	cfg.Remote = "ftp://delivery:secret@files.example/incoming/tile.tif"
+	cfg.ExternalID = "batch-42"
+	result, err := Run(context.Background(), Request{Config: cfg, Dial: single.dial, JobID: "job-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := singleLocal + ".bezorg-done.json"
+	if result.Manifest != manifestPath {
+		t.Fatalf("manifest path = %s", result.Manifest)
+	}
+	manifest := readManifest(t, manifestPath)
+	if manifest.Version != 1 || manifest.JobID != "job-1" || manifest.ExternalID != "batch-42" || manifest.Remote != "ftp://files.example/incoming/tile.tif" {
+		t.Fatalf("manifest = %+v", manifest)
+	}
+	if _, err := time.Parse(time.RFC3339, manifest.CompletedAt); err != nil || !strings.HasSuffix(manifest.CompletedAt, "Z") {
+		t.Fatalf("completed_at = %s", manifest.CompletedAt)
+	}
+	if len(manifest.Files) != 1 || manifest.Files[0].Path != "tile.tif" || manifest.Files[0].Size != int64(len(alpha)) || manifest.Files[0].SHA256 != hex.EncodeToString(alphaSum[:]) {
+		t.Fatalf("files = %+v", manifest.Files)
+	}
+	if strings.Contains(string(mustRead(t, manifestPath)), "secret") {
+		t.Fatal("manifest contains credentials")
+	}
+
+	dir := t.TempDir()
+	tree := &mem{files: map[string][]byte{"a.txt": alpha, "sub/b.txt": bravo}}
+	cfg = testConfig(t)
+	cfg.Local = dir
+	cfg.DoneSuffix = "_SUCCESS"
+	result, err = Run(context.Background(), Request{Config: cfg, Dial: tree.dial, JobID: "job-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Manifest != dir+"_SUCCESS" {
+		t.Fatalf("directory manifest = %s", result.Manifest)
+	}
+	manifest = readManifest(t, result.Manifest)
+	base := filepath.Base(dir)
+	if manifest.ExternalID != "" || manifest.JobID != "job-2" || len(manifest.Files) != 2 {
+		t.Fatalf("directory manifest = %+v", manifest)
+	}
+	if manifest.Files[0].Path > manifest.Files[1].Path {
+		t.Fatal("files were not sorted")
+	}
+	got := map[string]ManifestFile{}
+	for _, file := range manifest.Files {
+		got[file.Path] = file
+	}
+	if got[base+"/a.txt"].SHA256 != hex.EncodeToString(alphaSum[:]) || got[base+"/a.txt"].Size != int64(len(alpha)) {
+		t.Fatalf("alpha = %+v", got[base+"/a.txt"])
+	}
+	if got[base+"/sub/b.txt"].SHA256 != hex.EncodeToString(bravoSum[:]) || got[base+"/sub/b.txt"].Size != int64(len(bravo)) {
+		t.Fatalf("bravo = %+v", got[base+"/sub/b.txt"])
+	}
+}
+
+func TestCrashBeforeManifestLeavesNoMarker(t *testing.T) {
 	store := &mem{files: map[string][]byte{"a.txt": []byte("alpha")}}
 	cfg := testConfig(t)
-	cfg.ExternalID = " batch-42 "
-	final := filepath.Join(cfg.Local, "a.txt")
-	if err := os.Mkdir(final, 0o755); err != nil {
+	_, err := Run(context.Background(), Request{
+		Config: cfg,
+		Dial:   store.dial,
+		beforeManifestRename: func() error {
+			return errors.New("crash")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "crash") {
+		t.Fatalf("err = %v", err)
+	}
+	marker := cfg.Local + ".bezorg-done.json"
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("manifest left behind: %v", statErr)
+	}
+	if _, statErr := os.Stat(marker + cfg.TempSuffix); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("manifest temp left behind: %v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(cfg.Local, "a.txt")); statErr != nil {
+		t.Fatalf("data file missing after crash: %v", statErr)
+	}
+}
+
+func readManifest(t *testing.T, path string) Manifest {
+	t.Helper()
+	var manifest Manifest
+	if err := json.Unmarshal(mustRead(t, path), &manifest); err != nil {
 		t.Fatal(err)
 	}
-	_, err := Run(context.Background(), Request{Config: cfg, Dial: store.dial, JobID: "job-1"})
-	if err == nil {
-		t.Fatal("rename onto an existing directory succeeded")
-	}
-	body, err := os.ReadFile(final + ".bezorg-id")
+	return manifest
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	body, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(body, []byte(`"external_id": "batch-42"`)) || !bytes.Contains(body, []byte(`"job_id": "job-1"`)) || !bytes.Contains(body, []byte(`"remote": "/a.txt"`)) {
-		t.Fatalf("sidecar = %s", body)
-	}
-	if _, err := os.Stat(final + cfg.TempSuffix); err != nil {
-		t.Fatalf("partial missing after failed rename: %v", err)
-	}
-	if _, err := os.Stat(final + ".bezorg-id" + cfg.TempSuffix); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("sidecar temp still present: %v", err)
-	}
-
-	if err := os.RemoveAll(final); err != nil {
-		t.Fatal(err)
-	}
-	result, err := Run(context.Background(), Request{Config: cfg, Dial: store.dial, JobID: "job-1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.FilesDone != 1 || result.FilesFailed != 0 {
-		t.Fatalf("result = %+v", result)
-	}
-	got, err := os.ReadFile(final)
-	if err != nil || string(got) != "alpha" {
-		t.Fatalf("file = %q %v", got, err)
-	}
-	if _, err := os.Stat(final + ".bezorg-id"); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg.ExternalID = ""
-	plainDir := t.TempDir()
-	cfg.Local = plainDir
-	if _, err := Run(context.Background(), Request{Config: cfg, Dial: store.dial}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(plainDir, "a.txt.bezorg-id")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("sidecar written without an external id: %v", err)
-	}
+	return body
 }
 
 func TestEngineDryRunWritesNothing(t *testing.T) {

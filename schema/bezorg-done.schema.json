@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/GerhardOfRivia/bezorg/schema/bezorg-done.schema.json",
+  "title": "bezorg completion manifest",
+  "description": "Written as <local><done_suffix> after every file in a bezorg job has its final name. The default suffix is .bezorg-done.json. The Go type is transfer.Manifest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "job_id", "external_id", "remote", "completed_at", "files"],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "job_id": {
+      "type": "string",
+      "description": "Daemon job id. Empty for a foreground bezorg run."
+    },
+    "external_id": {
+      "type": "string",
+      "description": "Caller correlation id. Empty when the job did not set one."
+    },
+    "remote": {
+      "type": "string",
+      "description": "Remote path, or a URL with userinfo removed. Never contains credentials."
+    },
+    "completed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 UTC timestamp of when the manifest was published."
+    },
+    "files": {
+      "type": "array",
+      "description": "Every file in the delivery, sorted by path.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "size", "sha256"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Path relative to the directory containing the manifest, with forward slashes."
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    }
+  }
+}
