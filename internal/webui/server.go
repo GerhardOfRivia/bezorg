@@ -32,6 +32,15 @@ var dashboardCSS []byte
 //go:embed dashboard.js
 var dashboardJS []byte
 
+//go:embed openapi.json
+var openAPISpec []byte
+
+//go:embed docs.html
+var docsHTML []byte
+
+//go:embed docs.css
+var docsCSS []byte
+
 // Server is the optional HTTP dashboard. It listens on loopback, or on a
 // wildcard address when that is requested explicitly. Other hosts are refused.
 type Server struct {
@@ -277,6 +286,18 @@ func newHandler(svc control.Service, token string, allowRemoteIPHosts, publicRea
 	mux.HandleFunc("GET /{$}", serveAsset(dashboardHTML, "text/html; charset=utf-8"))
 	mux.HandleFunc("GET /dashboard.css", serveAsset(dashboardCSS, "text/css; charset=utf-8"))
 	mux.HandleFunc("GET /dashboard.js", serveAsset(dashboardJS, "text/javascript; charset=utf-8"))
+	mux.HandleFunc("GET /openapi.json", func(output http.ResponseWriter, request *http.Request) {
+		output.Header().Set("Content-Type", "application/json")
+		output.Header().Set("Cache-Control", "no-store")
+		if request.Method != http.MethodHead {
+			_, _ = output.Write(openAPISpec)
+		}
+	})
+	mux.HandleFunc("GET /docs", func(output http.ResponseWriter, request *http.Request) {
+		http.Redirect(output, request, "/docs/", http.StatusPermanentRedirect)
+	})
+	mux.HandleFunc("GET /docs/{$}", serveAsset(docsHTML, "text/html; charset=utf-8"))
+	mux.HandleFunc("GET /docs/docs.css", serveAsset(docsCSS, "text/css; charset=utf-8"))
 
 	return securityHeaders(validateHost(requireAPIAuth(token, mux, publicReads), allowRemoteIPHosts))
 }
