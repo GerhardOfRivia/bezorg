@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/GerhardOfRivia/bezorg/internal/config"
+	"github.com/GerhardOfRivia/bezorg/internal/events"
 	"github.com/GerhardOfRivia/bezorg/internal/job"
 	"github.com/GerhardOfRivia/bezorg/internal/lock"
 )
@@ -41,6 +42,7 @@ type Service interface {
 	Cancel(ctx context.Context, selector string) (job.Record, error)
 	Retry(ctx context.Context, selector string) (job.Record, error)
 	Logs(ctx context.Context, selector string, after int) ([]string, int, error)
+	Events(ctx context.Context, after int64, limit int) ([]events.Event, error)
 	System(ctx context.Context) (System, error)
 }
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/GerhardOfRivia/bezorg/internal/config"
 	"github.com/GerhardOfRivia/bezorg/internal/control"
 	"github.com/GerhardOfRivia/bezorg/internal/dialer"
+	"github.com/GerhardOfRivia/bezorg/internal/events"
 	"github.com/GerhardOfRivia/bezorg/internal/job"
 	"github.com/GerhardOfRivia/bezorg/internal/lock"
 	"github.com/GerhardOfRivia/bezorg/internal/metrics"
@@ -63,7 +65,11 @@ func Run(ctx context.Context, opt Options) error {
 	if err != nil {
 		return err
 	}
-	manager := newManager(store, opt)
+	eventLog, err := events.Open(filepath.Join(opt.StateDir, "events"), opt.Logger)
+	if err != nil {
+		return err
+	}
+	manager := newManager(store, eventLog, opt)
 	server, err := control.Listen(opt.Socket, manager)
 	if err != nil {
 		return err
@@ -154,6 +160,7 @@ func Run(ctx context.Context, opt Options) error {
 
 type manager struct {
 	store     *job.Store
+	events    *events.Log
 	log       *slog.Logger
 	version   string
 	socket    string
@@ -171,9 +178,10 @@ type manager struct {
 	wg       sync.WaitGroup
 }
 
-func newManager(store *job.Store, opt Options) *manager {
+func newManager(store *job.Store, eventLog *events.Log, opt Options) *manager {
 	m := &manager{
 		store:     store,
+		events:    eventLog,
 		log:       opt.Logger,
 		version:   opt.Version,
 		socket:    opt.Socket,
@@ -192,14 +200,20 @@ func (m *manager) resume() {
 	for _, rec := range m.store.List() {
 		switch rec.State {
 		case job.StateQueued, job.StateRunning, job.StateInterrupted:
+			previous := rec.State
 			if rec.State != job.StateQueued {
-				_, _ = m.store.Update(rec.ID, func(rec *job.Record) {
+				if updated, err := m.store.Update(rec.ID, func(rec *job.Record) {
 					rec.State = job.StateQueued
 					rec.FinishedAt = nil
 					rec.Error = ""
-				})
+				}); err == nil {
+					rec = updated
+				}
 			}
 			m.enqueue(rec.ID)
+			if previous != job.StateQueued {
+				m.emit(rec, events.DownloadQueued, "")
+			}
 			m.log.Info("resumed job", "job", rec.ID, "remote", rec.Config.Remote)
 		}
 	}
@@ -283,7 +297,7 @@ func (m *manager) execute(parent context.Context, id string) {
 	if userCanceled || stopping {
 		m.finishIfCanceled(id)
 		if stopping && !userCanceled {
-			m.mark(id, job.StateInterrupted, 4, "daemon stopped")
+			m.emit(m.mark(id, job.StateInterrupted, 4, "daemon stopped"), events.DownloadInterrupted, "")
 			m.observeJob(id, "interrupted", started)
 		} else {
 			m.observeJob(id, "canceled", started)
@@ -298,7 +312,7 @@ func (m *manager) execute(parent context.Context, id string) {
 		return
 	}
 	now := time.Now().UTC()
-	_, _ = m.store.Update(id, func(rec *job.Record) {
+	if updated, err := m.store.Update(id, func(rec *job.Record) {
 		rec.State = job.StateRunning
 		if rec.StartedAt == nil {
 			rec.StartedAt = &now
@@ -306,7 +320,10 @@ func (m *manager) execute(parent context.Context, id string) {
 		rec.FinishedAt = nil
 		rec.Error = ""
 		rec.ExitCode = -1
-	})
+	}); err == nil {
+		rec = updated
+		m.emit(updated, events.DownloadStarted, "")
+	}
 
 	logger, closeLog := m.jobLogger(rec)
 	defer closeLog()
@@ -344,12 +361,12 @@ func (m *manager) execute(parent context.Context, id string) {
 		return
 	}
 	if m.isStopping() || errors.Is(parent.Err(), context.Canceled) || errors.Is(runErr, context.Canceled) {
-		m.mark(id, job.StateInterrupted, 4, "interrupted")
+		m.emit(m.mark(id, job.StateInterrupted, 4, "interrupted"), events.DownloadInterrupted, "")
 		m.observeJob(id, "interrupted", started)
 		return
 	}
 	if runErr == nil && result.FilesFailed == 0 {
-		_, _ = m.store.Update(id, func(rec *job.Record) {
+		updated, _ := m.store.Update(id, func(rec *job.Record) {
 			rec.State = job.StateCompleted
 			rec.Progress = result.Snapshot
 			rec.Error = ""
@@ -357,6 +374,7 @@ func (m *manager) execute(parent context.Context, id string) {
 			finished := time.Now().UTC()
 			rec.FinishedAt = &finished
 		})
+		m.emit(updated, events.DownloadSucceeded, result.Manifest)
 		m.log.Info("job complete", "job", id, "files", result.FilesDone)
 		m.observeJob(id, "completed", started)
 		return
@@ -370,12 +388,14 @@ func (m *manager) execute(parent context.Context, id string) {
 	metrics.ObserveError(rec.Config.Protocol, "job", failure)
 	if !permanent && rec.Attempt < rec.Config.JobRetries {
 		next := rec.Attempt + 1
-		_, _ = m.store.Update(id, func(rec *job.Record) {
+		if updated, err := m.store.Update(id, func(rec *job.Record) {
 			rec.State = job.StateQueued
 			rec.Attempt = next
 			rec.Progress = result.Snapshot
 			rec.Error = message
-		})
+		}); err == nil {
+			m.emit(updated, events.DownloadRetried, "")
+		}
 		delay := retry.Backoff(next, rec.Config.JobRetryBase.Std(), rec.Config.JobRetryMax.Std())
 		m.log.Warn("job will retry", "job", id, "attempt", next, "delay", delay, "error", message)
 		if err := retry.Sleep(ctx, delay); err != nil {
@@ -384,7 +404,7 @@ func (m *manager) execute(parent context.Context, id string) {
 				m.observeJob(id, "canceled", started)
 				return
 			}
-			m.mark(id, job.StateInterrupted, 4, "interrupted")
+			m.emit(m.mark(id, job.StateInterrupted, 4, "interrupted"), events.DownloadInterrupted, "")
 			m.observeJob(id, "interrupted", started)
 			return
 		}
@@ -393,7 +413,7 @@ func (m *manager) execute(parent context.Context, id string) {
 				m.mark(id, job.StateCanceled, 4, "canceled")
 				m.observeJob(id, "canceled", started)
 			} else {
-				m.mark(id, job.StateInterrupted, 4, "interrupted")
+				m.emit(m.mark(id, job.StateInterrupted, 4, "interrupted"), events.DownloadInterrupted, "")
 				m.observeJob(id, "interrupted", started)
 			}
 			return
@@ -403,7 +423,7 @@ func (m *manager) execute(parent context.Context, id string) {
 		m.enqueue(id)
 		return
 	}
-	_, _ = m.store.Update(id, func(rec *job.Record) {
+	updated, _ := m.store.Update(id, func(rec *job.Record) {
 		rec.State = job.StateFailed
 		rec.Progress = result.Snapshot
 		rec.Error = message
@@ -411,6 +431,7 @@ func (m *manager) execute(parent context.Context, id string) {
 		finished := time.Now().UTC()
 		rec.FinishedAt = &finished
 	})
+	m.emit(updated, events.DownloadFailed, "")
 	m.log.Error("job failed", "job", id, "error", message)
 	m.observeJob(id, "failed", started)
 }
@@ -480,14 +501,41 @@ func (m *manager) isStopping() bool {
 	return m.stopping
 }
 
-func (m *manager) mark(id, state string, code int, message string) {
-	_, _ = m.store.Update(id, func(rec *job.Record) {
+func (m *manager) mark(id, state string, code int, message string) job.Record {
+	updated, err := m.store.Update(id, func(rec *job.Record) {
 		rec.State = state
 		rec.ExitCode = code
 		rec.Error = message
 		finished := time.Now().UTC()
 		rec.FinishedAt = &finished
 	})
+	if err != nil {
+		return job.Record{ID: id, State: state, Error: message, ExitCode: code}
+	}
+	return updated
+}
+
+func (m *manager) emit(rec job.Record, kind, manifest string) {
+	if m.events == nil || rec.ID == "" {
+		return
+	}
+	if _, err := m.events.Append(events.Event{
+		Type:         kind,
+		JobID:        rec.ID,
+		ExternalID:   rec.ExternalID,
+		Remote:       rec.Config.Remote,
+		Local:        rec.Config.Local,
+		Status:       rec.State,
+		Attempts:     rec.Attempt,
+		Bytes:        rec.Progress.BytesDone,
+		JobCreatedAt: rec.CreatedAt,
+		UpdatedAt:    rec.UpdatedAt,
+		StartedAt:    rec.StartedAt,
+		FinishedAt:   rec.FinishedAt,
+		Manifest:     manifest,
+	}); err != nil {
+		m.log.Warn("record download event", "job", rec.ID, "type", kind, "error", err)
+	}
 }
 
 func (m *manager) stop() {
@@ -523,6 +571,7 @@ func (m *manager) Submit(_ context.Context, cfg config.Config) (job.Record, erro
 		return job.Record{}, err
 	}
 	m.enqueue(rec.ID)
+	m.emit(rec, events.DownloadQueued, "")
 	m.log.Info("job queued", "job", rec.ID, "host", cfg.Host, "remote", cfg.Remote)
 	return job.Public(rec), nil
 }
@@ -610,6 +659,7 @@ func (m *manager) Retry(_ context.Context, selector string) (job.Record, error) 
 	if err != nil {
 		return job.Record{}, err
 	}
+	m.emit(updated, events.DownloadRetried, "")
 	m.enqueue(rec.ID)
 	return job.Public(updated), nil
 }
@@ -620,6 +670,13 @@ func (m *manager) Logs(_ context.Context, selector string, after int) ([]string,
 		return nil, after, err
 	}
 	return m.store.Logs(rec.ID, after, 1000)
+}
+
+func (m *manager) Events(_ context.Context, after int64, limit int) ([]events.Event, error) {
+	if m.events == nil {
+		return nil, errors.New("event log is not open")
+	}
+	return m.events.List(after, limit)
 }
 
 func (m *manager) System(context.Context) (control.System, error) {

@@ -205,6 +205,28 @@ daemon.SetFileExternalID(func(_ config.WatchConfig, file watcher.File) (string, 
 })
 ```
 
+## Download events
+
+`bezorgd` appends a durable event for each download transition. The log lives in the state directory under `events/`, mode `0600`. Sequence numbers start at 1, survive a restart, and are not reused when old lines are deleted. The newest 10,000 events are kept.
+
+| Type | When |
+| --- | --- |
+| `download.queued` | The job is accepted, or a crashed running job is queued again on startup |
+| `download.started` | A worker begins the transfer |
+| `download.succeeded` | The completion manifest has been renamed into place |
+| `download.failed` | The job stopped with a failure and will not retry on its own |
+| `download.retried` | A transient failure, or `bezorg retry`, queued the job again |
+| `download.interrupted` | The daemon stopped while the job was running |
+
+The payload carries `seq`, `job_id`, `external_id` when set, `remote`, `local`, `status`, `attempts`, `bytes`, and the event and job timestamps. `download.succeeded` also carries `manifest`, the absolute path of the completion marker.
+
+```text
+GET /api/v1/events?after=0&timeout=25&stream=poll
+GET /api/v1/events?after=0&timeout=60&stream=sse
+```
+
+`stream=poll` is JSON: `{events, after, next}`. Pass `next` back as `after`. `stream=sse` is `text/event-stream` with `id`, `event`, and `data`. `Last-Event-ID` overrides `after`. An empty `Accept`, or `*/*`, stays on JSON so plain curl does not have to set a header. `Accept: text/event-stream` selects SSE when `stream` is omitted. `timeout` is seconds from 0 to 60 and defaults to 25. `0` returns what is already stored. A cursor older than the retained window resumes at the next stored sequence. Reads follow the same token rules as the other GET routes. The Unix socket does not serve this stream.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -281,6 +303,7 @@ The page talks to:
 | --- | --- | --- |
 | GET | `/api/v1/system` | token, unless public read |
 | GET | `/api/v1/jobs` | token, unless public read. `?external_id=` matches that id exactly |
+| GET | `/api/v1/events?after=N` | token, unless public read. JSON long-poll, or SSE when `stream=sse` or `Accept: text/event-stream` |
 | GET | `/api/v1/jobs/{id}` | token, unless public read |
 | GET | `/api/v1/jobs/{id}/logs?after=N` | token, unless public read |
 | POST | `/api/v1/jobs/{id}/cancel` | token |
