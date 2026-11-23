@@ -146,6 +146,25 @@ func (l *Log) Append(event Event) (Event, error) {
 	return event, nil
 }
 
+// HighWater is the highest sequence issued, including events already pruned.
+func (l *Log) HighWater() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.next <= 1 {
+		return 0
+	}
+	return l.next - 1
+}
+
+// Snapshot returns every retained event, oldest first.
+func (l *Log) Snapshot() []Event {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]Event, len(l.events))
+	copy(out, l.events)
+	return out
+}
+
 // List returns events with seq greater than after, oldest first.
 // limit <= 0 selects 100. limit above 1000 is capped.
 func (l *Log) List(after int64, limit int) ([]Event, error) {

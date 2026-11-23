@@ -22,6 +22,7 @@ import (
 	"github.com/GerhardOfRivia/bezorg/internal/events"
 	"github.com/GerhardOfRivia/bezorg/internal/job"
 	"github.com/GerhardOfRivia/bezorg/internal/lock"
+	"github.com/GerhardOfRivia/bezorg/internal/webhook"
 )
 
 const (
@@ -43,6 +44,10 @@ type Service interface {
 	Retry(ctx context.Context, selector string) (job.Record, error)
 	Logs(ctx context.Context, selector string, after int) ([]string, int, error)
 	Events(ctx context.Context, after int64, limit int) ([]events.Event, error)
+	CreateWebhook(ctx context.Context, params webhook.Params) (webhook.Hook, error)
+	ListWebhooks(ctx context.Context) ([]webhook.Hook, error)
+	DeleteWebhook(ctx context.Context, id int64) error
+	ListWebhookDeliveries(ctx context.Context, id int64, status string, limit int) ([]webhook.Delivery, error)
 	System(ctx context.Context) (System, error)
 }
 
