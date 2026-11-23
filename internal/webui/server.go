@@ -93,9 +93,10 @@ func NewServer(address, tokenPath string, svc control.Service, logger *slog.Logg
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       time.Minute,
-		MaxHeaderBytes:    16 << 10,
+		// Long-poll and SSE may hold the response open for up to 60s.
+		WriteTimeout:   90 * time.Second,
+		IdleTimeout:    time.Minute,
+		MaxHeaderBytes: 16 << 10,
 	}
 	if wildcard {
 		logger.Warn("web dashboard is listening on all network interfaces; HTTP is unencrypted, so protect the access token and restrict network access",

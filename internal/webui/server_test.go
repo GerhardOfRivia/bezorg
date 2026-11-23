@@ -16,6 +16,7 @@ import (
 
 	"github.com/GerhardOfRivia/bezorg/internal/config"
 	"github.com/GerhardOfRivia/bezorg/internal/control"
+	"github.com/GerhardOfRivia/bezorg/internal/events"
 	"github.com/GerhardOfRivia/bezorg/internal/job"
 	"github.com/GerhardOfRivia/bezorg/internal/transfer"
 )
@@ -232,6 +233,7 @@ type fakeService struct {
 	system   control.System
 	jobs     map[string]job.Record
 	logs     map[string][]string
+	feed     []events.Event
 	canceled string
 	retried  string
 }
@@ -310,6 +312,25 @@ func (f *fakeService) Logs(_ context.Context, selector string, after int) ([]str
 
 func (f *fakeService) System(context.Context) (control.System, error) {
 	return f.system, nil
+}
+
+func (f *fakeService) Events(_ context.Context, after int64, limit int) ([]events.Event, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if limit <= 0 {
+		limit = 100
+	}
+	out := make([]events.Event, 0)
+	for _, event := range f.feed {
+		if event.Seq <= after {
+			continue
+		}
+		out = append(out, event)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeService) canceledID() string {

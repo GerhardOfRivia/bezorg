@@ -68,6 +68,7 @@ func TestDaemonCompletesJobAfterClientExits(t *testing.T) {
 	cfg.Password = srv.Password
 	cfg.Remote = "/srv"
 	cfg.Local = local
+	cfg.ExternalID = "batch-42"
 	cfg.Checksum = config.ChecksumOff
 	cfg.Concurrency = 2
 	cfg.Keepalive = 0
@@ -121,6 +122,18 @@ func TestDaemonCompletesJobAfterClientExits(t *testing.T) {
 	}
 	if !bytes.Equal(body, []byte("from-daemon")) {
 		t.Fatalf("file = %q", body)
+	}
+	logText, err := os.ReadFile(filepath.Join(stateDir, "events", "log.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := local + ".bezorg-done.json"
+	if !bytes.Contains(logText, []byte("download.queued")) || !bytes.Contains(logText, []byte("download.started")) || !bytes.Contains(logText, []byte("download.succeeded")) || !bytes.Contains(logText, []byte("batch-42")) || !bytes.Contains(logText, []byte(manifestPath)) {
+		t.Fatalf("event log = %s", logText)
+	}
+	manifest, err := os.ReadFile(manifestPath)
+	if err != nil || !bytes.Contains(manifest, []byte(`"external_id": "batch-42"`)) || !bytes.Contains(manifest, []byte(`"version": 1`)) {
+		t.Fatalf("manifest %s %v", manifest, err)
 	}
 
 	cancel()
