@@ -244,6 +244,29 @@ Each later event queues a delivery. The POST body is the event JSON. Headers are
 
 `bezorg_webhook_deliveries_total` counts tries as `succeeded`, `retry`, or `dead`.
 
+## Creating a download
+
+`POST /api/v1/jobs` queues a download on the daemon. The bearer token is required. The body uses the same connection fields as a job file (`protocol`, `host`, `user`, `password`, `remote`, `local`, and the rest), plus:
+
+| Field | Meaning |
+| --- | --- |
+| `source` | Remote path, or an `ftp`, `ftps`, or `sftp` URL. A URL must not contain a password. |
+| `destination` | Absolute local file or directory. Same role as `local`. |
+| `external_id` | Optional correlation id. A non-empty id is unique. |
+| `priority` | Integer from -1000000 to 1000000. Higher values run first. Default 0. |
+| `metadata` | JSON object, at most 8192 bytes. It is stored and returned, and it is not logged. |
+
+`destination` is cleaned. Symlinks in the existing prefix are resolved and the rest of the path stays under that directory. The filesystem root and the daemon state directory are rejected, so a download cannot overwrite job records or webhook secrets.
+
+A new download returns **201** `{"job": ...}`. The password is redacted. Repeating the POST with the same non-empty `external_id` returns **409** and the existing job:
+
+```json
+{"error": {"code": "external_id_conflict", "message": "A download with this external_id already exists"}, "job": {}}
+```
+
+Treat that as the idempotent result and continue with the returned job. An empty `external_id` always creates a new download. `bezorg fetch --external-id` uses the same rule and prints the existing id.
+
+
 ## Exit codes
 
 | Code | Meaning |
@@ -323,6 +346,7 @@ The page talks to:
 | GET | `/api/v1/events?after=N` | token, unless public read. JSON long-poll, or SSE when `stream=sse` or `Accept: text/event-stream` |
 | GET | `/api/v1/jobs/{id}` | token, unless public read |
 | GET | `/api/v1/jobs/{id}/logs?after=N` | token, unless public read |
+| POST | `/api/v1/jobs` | token. Creates a download. A repeated `external_id` returns 409 and the existing job |
 | POST | `/api/v1/jobs/{id}/cancel` | token |
 | POST | `/api/v1/jobs/{id}/retry` | token |
 

@@ -4,11 +4,13 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,7 @@ import (
 	"github.com/GerhardOfRivia/bezorg/internal/job"
 	"github.com/GerhardOfRivia/bezorg/internal/lock"
 	"github.com/GerhardOfRivia/bezorg/internal/metrics"
+	"github.com/GerhardOfRivia/bezorg/internal/paths"
 	"github.com/GerhardOfRivia/bezorg/internal/remote"
 	"github.com/GerhardOfRivia/bezorg/internal/retry"
 	"github.com/GerhardOfRivia/bezorg/internal/transfer"
@@ -180,7 +183,7 @@ type manager struct {
 
 	mu       sync.Mutex
 	cond     *sync.Cond
-	queue    []string
+	queue    []queueItem
 	active   int
 	running  map[string]context.CancelFunc
 	canceled map[string]struct{}
@@ -230,9 +233,27 @@ func (m *manager) resume() {
 	}
 }
 
+type queueItem struct {
+	id       string
+	priority int
+	created  time.Time
+}
+
 func (m *manager) enqueue(id string) {
+	priority := 0
+	var created time.Time
+	if rec, err := m.store.Get(id); err == nil {
+		priority = rec.Priority
+		created = rec.CreatedAt
+	}
 	m.mu.Lock()
-	m.queue = append(m.queue, id)
+	m.queue = append(m.queue, queueItem{id: id, priority: priority, created: created})
+	sort.SliceStable(m.queue, func(i, j int) bool {
+		if m.queue[i].priority != m.queue[j].priority {
+			return m.queue[i].priority > m.queue[j].priority
+		}
+		return m.queue[i].created.Before(m.queue[j].created)
+	})
 	m.publishLocked()
 	m.cond.Broadcast()
 	m.mu.Unlock()
@@ -277,7 +298,7 @@ func (m *manager) next(ctx context.Context) (string, bool) {
 			return "", false
 		}
 		if m.active < m.max && len(m.queue) > 0 {
-			id := m.queue[0]
+			id := m.queue[0].id
 			m.queue = m.queue[1:]
 			m.active++
 			m.publishLocked()
@@ -580,18 +601,30 @@ func (m *manager) wait(ctx context.Context) {
 	}
 }
 
-func (m *manager) Submit(_ context.Context, cfg config.Config) (job.Record, error) {
+func (m *manager) Submit(ctx context.Context, cfg config.Config) (job.Record, error) {
+	return m.SubmitDownload(ctx, cfg, 0, nil)
+}
+
+func (m *manager) SubmitDownload(_ context.Context, cfg config.Config, priority int, metadata json.RawMessage) (job.Record, error) {
 	cfg, err := config.Validate(cfg)
 	if err != nil {
 		return job.Record{}, err
 	}
-	rec, err := m.store.Create(cfg)
+	local, err := paths.SafeLocal(cfg.Local, m.stateDir)
+	if err != nil {
+		return job.Record{}, err
+	}
+	cfg.Local = local
+	rec, err := m.store.CreateWith(cfg, priority, metadata)
+	if errors.Is(err, job.ErrExternalIDInUse) {
+		return job.Public(rec), err
+	}
 	if err != nil {
 		return job.Record{}, err
 	}
 	m.enqueue(rec.ID)
 	m.emit(rec, events.DownloadQueued, "")
-	m.log.Info("job queued", "job", rec.ID, "host", cfg.Host, "remote", cfg.Remote)
+	m.log.Info("job queued", "job", rec.ID, "host", cfg.Host, "remote", cfg.Remote, "priority", rec.Priority)
 	return job.Public(rec), nil
 }
 
@@ -627,12 +660,12 @@ func (m *manager) Cancel(_ context.Context, selector string) (job.Record, error)
 	cancel := m.running[rec.ID]
 	filtered := m.queue[:0]
 	queued := false
-	for _, id := range m.queue {
-		if id == rec.ID {
+	for _, item := range m.queue {
+		if item.id == rec.ID {
 			queued = true
 			continue
 		}
-		filtered = append(filtered, id)
+		filtered = append(filtered, item)
 	}
 	m.queue = filtered
 	m.publishLocked()

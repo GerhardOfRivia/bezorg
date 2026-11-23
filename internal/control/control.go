@@ -35,9 +35,13 @@ var ErrAlreadyRunning = errors.New("bezorgd is already running")
 // ErrDaemonUnavailable means the socket could not be dialed.
 var ErrDaemonUnavailable = errors.New("bezorgd is not running")
 
+// errConflict is the client's view of an idempotent external-id collision.
+var errConflict = errors.New("conflict")
+
 // Service is the daemon surface exposed on the socket.
 type Service interface {
 	Submit(ctx context.Context, cfg config.Config) (job.Record, error)
+	SubmitDownload(ctx context.Context, cfg config.Config, priority int, metadata json.RawMessage) (job.Record, error)
 	List(ctx context.Context, externalID string) ([]job.Record, error)
 	Get(ctx context.Context, selector string) (job.Record, error)
 	Cancel(ctx context.Context, selector string) (job.Record, error)
@@ -109,6 +113,14 @@ func Listen(socketPath string, svc Service) (*Server, error) {
 			return
 		}
 		rec, err := svc.Submit(r.Context(), cfg)
+		if errors.Is(err, job.ErrExternalIDInUse) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error": err.Error(),
+				"code":  "external_id_conflict",
+				"job":   rec,
+			})
+			return
+		}
 		write(w, map[string]any{"job": rec}, err)
 	})
 	mux.HandleFunc("GET /v1/jobs", func(w http.ResponseWriter, r *http.Request) {
@@ -221,7 +233,7 @@ func write(w http.ResponseWriter, body any, err error) {
 			status = http.StatusNotFound
 		case errors.Is(err, job.ErrAmbiguous):
 			status = http.StatusConflict
-		case strings.HasPrefix(err.Error(), "config:"):
+		case strings.HasPrefix(err.Error(), "config:"), strings.HasPrefix(err.Error(), "destination"), strings.HasPrefix(err.Error(), "job:"):
 			status = http.StatusBadRequest
 		}
 		writeErr(w, status, err)
@@ -273,9 +285,13 @@ func (c *Client) Socket() string { return c.socket }
 // Submit queues a job.
 func (c *Client) Submit(ctx context.Context, cfg config.Config) (job.Record, error) {
 	var response struct {
-		Job job.Record `json:"job"`
+		Job  job.Record `json:"job"`
+		Code string     `json:"code"`
 	}
 	err := c.do(ctx, http.MethodPost, "/v1/jobs", cfg, &response)
+	if errors.Is(err, errConflict) && response.Code == "external_id_conflict" {
+		return response.Job, job.ErrExternalIDInUse
+	}
 	return response.Job, err
 }
 
@@ -364,9 +380,17 @@ func (c *Client) do(ctx context.Context, method, path string, body, dest any) er
 	}
 	if resp.StatusCode >= 300 {
 		var payload struct {
-			Error string `json:"error"`
+			Error string     `json:"error"`
+			Code  string     `json:"code"`
+			Job   job.Record `json:"job"`
 		}
 		_ = json.Unmarshal(data, &payload)
+		if dest != nil {
+			_ = json.Unmarshal(data, dest)
+		}
+		if resp.StatusCode == http.StatusConflict && payload.Code == "external_id_conflict" {
+			return errConflict
+		}
 		if payload.Error == "" {
 			payload.Error = resp.Status
 		}

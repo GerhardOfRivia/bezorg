@@ -33,6 +33,8 @@ var (
 	ErrNotFound = errors.New("job not found")
 	// ErrAmbiguous means a prefix matched more than one job.
 	ErrAmbiguous = errors.New("ambiguous job selector")
+	// ErrExternalIDInUse means a non-empty external id already belongs to a download.
+	ErrExternalIDInUse = errors.New("external id already belongs to another download")
 )
 
 // Record is the durable view of one download.
@@ -49,9 +51,13 @@ type Record struct {
 	Error      string            `json:"error,omitempty"`
 	ExitCode   int               `json:"exit_code"`
 	// ExternalID is an optional caller-defined correlation id. Empty means
-	// unset and is omitted. It is indexed for exact-match lookup. The same id
-	// may appear on more than one job until a caller asks for idempotent create.
+	// unset and is omitted. A non-empty id is unique.
 	ExternalID string `json:"external_id,omitempty"`
+	// Priority orders queued downloads. Higher values run first. Equal
+	// priorities stay in creation order. Zero is omitted.
+	Priority int `json:"priority,omitempty"`
+	// Metadata is an optional JSON object supplied at creation. It is not logged.
+	Metadata json.RawMessage `json:"metadata,omitempty"`
 }
 
 // Terminal reports whether the daemon will not touch the job again until
@@ -117,8 +123,33 @@ func Open(dir string, logger *slog.Logger) (*Store, error) {
 
 // Create queues a new job and returns a copy of its record.
 func (s *Store) Create(cfg config.Config) (Record, error) {
+	return s.CreateWith(cfg, 0, nil)
+}
+
+// CreateWith queues a job with an optional priority and metadata object.
+// A non-empty external id that already exists returns that job and
+// ErrExternalIDInUse, and does not insert a second record.
+func (s *Store) CreateWith(cfg config.Config, priority int, metadata json.RawMessage) (Record, error) {
+	if priority < -1_000_000 || priority > 1_000_000 {
+		return Record{}, errors.New("job: priority must be from -1000000 to 1000000")
+	}
+	metadata, err := normalizeMetadata(metadata)
+	if err != nil {
+		return Record{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	externalID, err := config.NormalizeExternalID(cfg.ExternalID)
+	if err != nil {
+		return Record{}, err
+	}
+	if externalID != "" {
+		for _, id := range s.byExternal[externalID] {
+			if existing := s.all[id]; existing != nil && existing.ExternalID == externalID {
+				return *existing, ErrExternalIDInUse
+			}
+		}
+	}
 	id, err := newID()
 	if err != nil {
 		return Record{}, err
@@ -132,10 +163,6 @@ func (s *Store) Create(cfg config.Config) (Record, error) {
 			return Record{}, err
 		}
 	}
-	externalID, err := config.NormalizeExternalID(cfg.ExternalID)
-	if err != nil {
-		return Record{}, err
-	}
 	cfg.ExternalID = ""
 	now := time.Now().UTC()
 	rec := &Record{
@@ -146,6 +173,8 @@ func (s *Store) Create(cfg config.Config) (Record, error) {
 		Config:     cfg,
 		ExitCode:   -1,
 		ExternalID: externalID,
+		Priority:   priority,
+		Metadata:   metadata,
 	}
 	if err := s.save(rec); err != nil {
 		return Record{}, err
@@ -153,6 +182,20 @@ func (s *Store) Create(cfg config.Config) (Record, error) {
 	s.all[id] = rec
 	s.indexLocked(id, rec.ExternalID)
 	return *rec, nil
+}
+
+func normalizeMetadata(raw json.RawMessage) (json.RawMessage, error) {
+	if strings.TrimSpace(string(raw)) == "" || string(raw) == "null" {
+		return nil, nil
+	}
+	if len(raw) > 8192 {
+		return nil, errors.New("job: metadata is larger than 8192 bytes")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return nil, errors.New("job: metadata must be a JSON object")
+	}
+	return raw, nil
 }
 
 // ListByExternalID returns jobs whose external id matches exactly, newest first.

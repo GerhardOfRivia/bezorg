@@ -1,6 +1,8 @@
 package job
 
 import (
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -27,8 +29,8 @@ func TestExternalIDIsStoredIndexedAndOmittedWhenEmpty(t *testing.T) {
 	cfg.ExternalID = "batch-42"
 	cfg.Remote = "/drop/b"
 	second, err := store.Create(cfg)
-	if err != nil || second.ExternalID != "batch-42" || second.ID == first.ID {
-		t.Fatalf("duplicate id should be allowed on create, got %+v %v", second, err)
+	if !errors.Is(err, ErrExternalIDInUse) || second.ID != first.ID || second.ExternalID != "batch-42" {
+		t.Fatalf("duplicate id = %+v %v", second, err)
 	}
 	cfg.ExternalID = ""
 	plain, err := store.Create(cfg)
@@ -37,11 +39,11 @@ func TestExternalIDIsStoredIndexedAndOmittedWhenEmpty(t *testing.T) {
 	}
 
 	matched, err := store.ListByExternalID(" batch-42 ")
-	if err != nil || len(matched) != 2 {
+	if err != nil || len(matched) != 1 {
 		t.Fatalf("matched = %+v %v", matched, err)
 	}
-	if matched[0].CreatedAt.Before(matched[1].CreatedAt) {
-		t.Fatal("matches were not newest first")
+	if matched[0].ID != first.ID {
+		t.Fatalf("match = %+v", matched[0])
 	}
 	none, err := store.ListByExternalID("missing")
 	if err != nil || len(none) != 0 {
@@ -60,8 +62,18 @@ func TestExternalIDIsStoredIndexedAndOmittedWhenEmpty(t *testing.T) {
 		t.Fatalf("reloaded = %+v %v", loaded, err)
 	}
 	again, err := reopened.ListByExternalID("batch-42")
-	if err != nil || len(again) != 2 {
+	if err != nil || len(again) != 1 || again[0].ID != first.ID {
 		t.Fatalf("reindexed = %+v %v", again, err)
+	}
+	next := cfg
+	next.ExternalID = ""
+	next.Remote = "/drop/c"
+	withMeta, err := store.CreateWith(next, 4, json.RawMessage(`{"source":"bezorg"}`))
+	if err != nil || withMeta.Priority != 4 || !strings.Contains(string(withMeta.Metadata), "bezorg") {
+		t.Fatalf("metadata = %+v %v", withMeta, err)
+	}
+	if _, err := store.CreateWith(next, 4, json.RawMessage(`[]`)); err == nil {
+		t.Fatal("metadata array accepted")
 	}
 	public := Public(loaded)
 	if public.ExternalID != "batch-42" || public.Config.Password == "secret" {

@@ -206,6 +206,11 @@ func runFetch(args []string, stdout, stderr io.Writer, wait bool) int {
 	defer cancel()
 	client := control.NewClient(paths.Socket(socket))
 	rec, err := client.Submit(ctx, cfg)
+	if errors.Is(err, job.ErrExternalIDInUse) {
+		fmt.Fprintln(stderr, "bezorg: external_id already exists")
+		fmt.Fprintln(stdout, rec.ID)
+		return exitOK
+	}
 	if err != nil {
 		fmt.Fprintln(stderr, "bezorg:", err)
 		if errors.Is(err, control.ErrDaemonUnavailable) {
